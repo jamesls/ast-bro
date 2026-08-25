@@ -51,7 +51,7 @@ pub fn run(
         let lang = match parse_lang(l) {
             Some(l) => l,
             None => {
-                eprintln!("error: unsupported language '{}'", l);
+                eprintln!("error: {}", unsupported_language_message(l));
                 return 2;
             }
         };
@@ -365,6 +365,15 @@ pub fn parse_lang(s: &str) -> Option<SupportLang> {
         "rb" | "ruby" => Some(SupportLang::Ruby),
         "php" => Some(SupportLang::Php),
         other => SupportLang::from_str(other).ok(),
+    }
+}
+
+/// Builds the `run` diagnostic for an unsupported language.
+pub(crate) fn unsupported_language_message(language: &str) -> String {
+    if language.eq_ignore_ascii_case("zig") {
+        "zig is not supported by run: ast-grep has no Zig grammar".to_owned()
+    } else {
+        format!("unsupported language '{}'", language)
     }
 }
 

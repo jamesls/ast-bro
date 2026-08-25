@@ -37,6 +37,7 @@ path = "src/bin/sb.rs"
 ast-grep-core = "0.42.1"
 ast-grep-language = "0.42.1"
 tree-sitter = "0.26.3"
+tree-sitter-zig = "1.1.2"
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4.22"
 rayon = "1.10"

@@ -29,6 +29,37 @@ fn write(p: &std::path::Path, body: &str) {
     std::fs::write(p, body).unwrap();
 }
 
+fn zig_calls_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("temporary Zig call project");
+    let root = tmp.path();
+    write(&root.join("build.zig"), "pub fn build() void {}\n");
+    write(
+        &root.join("main.zig"),
+        include_str!("fixtures/calls/zig/main.zig"),
+    );
+    write(
+        &root.join("support/helper.zig"),
+        include_str!("fixtures/calls/zig/support/helper.zig"),
+    );
+    write(
+        &root.join("decoy.zig"),
+        include_str!("fixtures/calls/zig/decoy.zig"),
+    );
+    tmp
+}
+
+fn assert_unresolved_zig_call(output: &str, callee: &str) {
+    let doc: serde_json::Value = serde_json::from_str(output.trim()).expect("callees JSON");
+    let edge = doc["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .find(|edge| edge["kind"] == "call")
+        .expect("call edge");
+    assert_eq!(edge["target"], format!("[unresolved] {callee}"), "{output}");
+    assert_eq!(edge["confidence"], "Ambiguous", "{output}");
+}
+
 #[test]
 fn rust_callers_finds_cross_file_caller() {
     let tmp = tempfile::tempdir().unwrap();
@@ -860,6 +891,367 @@ func pingTwice() {
         "expected `pingTwice` in callers, got:\n{}",
         out
     );
+}
+
+#[test]
+fn zig_callers_finds_intra_file_caller() {
+    let tmp = zig_calls_fixture();
+    let root = tmp.path();
+    let (out, code) = run_in(
+        root,
+        &["callers", "leaf", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "callers exited non-zero: {out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid callers JSON");
+    let matches = doc["matches"].as_array().expect("matches array");
+    assert!(
+        matches.iter().any(|entry| {
+            entry["source"] == "main.zig::calls_leaf"
+                && entry["target"] == "main.zig::leaf"
+                && entry["confidence"] == "Exact"
+        }),
+        "expected calls_leaf to resolve leaf exactly, got:\n{out}"
+    );
+}
+
+#[test]
+fn zig_callees_lists_construct_and_invocation() {
+    let tmp = zig_calls_fixture();
+    let root = tmp.path();
+    let (out, code) = run_in(
+        root,
+        &[
+            "callees",
+            "build_and_ping",
+            ".",
+            "--rebuild",
+            "--external",
+            "--json",
+            "--compact",
+        ],
+    );
+    assert_eq!(code, 0, "callees exited non-zero: {out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid callees JSON");
+    let matches = doc["matches"].as_array().expect("matches array");
+    assert!(
+        matches.iter().any(|entry| {
+            entry["kind"] == "construct"
+                && entry["target"]
+                    .as_str()
+                    .is_some_and(|target| target.ends_with("Widget"))
+        }),
+        "expected a typed Widget construction, got:\n{out}"
+    );
+    assert!(
+        matches.iter().any(|entry| {
+            entry["kind"] == "call" && entry["target"] == "main.zig::Widget::ping"
+        }),
+        "expected widget.ping() to resolve to Widget.ping, got:\n{out}"
+    );
+}
+
+#[test]
+fn zig_import_namespace_resolves_exact_with_homonym() {
+    let tmp = zig_calls_fixture();
+    let root = tmp.path();
+    let (out, code) = run_in(
+        root,
+        &[
+            "callees",
+            "imported_call",
+            ".",
+            "--rebuild",
+            "--json",
+            "--compact",
+        ],
+    );
+    assert_eq!(code, 0, "callees exited non-zero: {out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid callees JSON");
+    let matches = doc["matches"].as_array().expect("matches array");
+    assert!(
+        matches.iter().any(|entry| {
+            entry["target"] == "support/helper.zig::work" && entry["confidence"] == "Exact"
+        }),
+        "expected helper.work() to resolve exactly through @import, got:\n{out}"
+    );
+    assert!(
+        !matches
+            .iter()
+            .any(|entry| entry["target"] == "decoy.zig::work"),
+        "the unimported work homonym must not capture helper.work():\n{out}"
+    );
+}
+
+#[test]
+fn zig_field_expression_preserves_qualified_receiver() {
+    let tmp = zig_calls_fixture();
+    let root = tmp.path();
+    let (out, code) = run_in(
+        root,
+        &[
+            "callers",
+            "main.zig:print",
+            ".",
+            "--rebuild",
+            "--json",
+            "--compact",
+        ],
+    );
+    assert_eq!(code, 0, "callers exited non-zero: {out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid callers JSON");
+    let unattributed = doc["unattributed"].as_array().expect("unattributed array");
+    assert!(
+        unattributed.iter().any(|entry| {
+            entry["source"] == "main.zig::field_receiver"
+                && entry["callee"] == "print"
+                && entry["receiver"] == "std.debug"
+        }),
+        "expected field_expression receiver text `std.debug`, got:\n{out}"
+    );
+}
+
+#[test]
+fn zig_self_and_capital_self_receivers_resolve_exact() {
+    let tmp = zig_calls_fixture();
+    let root = tmp.path();
+    let (out, code) = run_in(
+        root,
+        &[
+            "callees",
+            "receiver_calls",
+            ".",
+            "--rebuild",
+            "--json",
+            "--compact",
+        ],
+    );
+    assert_eq!(code, 0, "callees exited non-zero: {out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid callees JSON");
+    let matches = doc["matches"].as_array().expect("matches array");
+    for target in ["main.zig::Widget::ping", "main.zig::Widget::static_value"] {
+        assert!(
+            matches
+                .iter()
+                .any(|entry| { entry["target"] == target && entry["confidence"] == "Exact" }),
+            "expected self-like receiver to resolve {target} exactly, got:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn zig_test_declaration_owns_its_calls() {
+    let tmp = zig_calls_fixture();
+    let root = tmp.path();
+    let (out, code) = run_in(
+        root,
+        &["callers", "leaf", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "callers exited non-zero: {out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid callers JSON");
+    let matches = doc["matches"].as_array().expect("matches array");
+    assert!(
+        matches.iter().any(|entry| {
+            entry["source"] == "main.zig::call stays with test owner"
+                && entry["target"] == "main.zig::leaf"
+                && entry["confidence"] == "Exact"
+        }),
+        "expected the inline test, not an enclosing declaration, to own leaf(), got:\n{out}"
+    );
+}
+
+#[test]
+fn zig_namespace_import_update_matches_cold_exact_resolution() {
+    let tmp = tempfile::tempdir().expect("temporary Zig project");
+    let root = tmp.path();
+    write(&root.join("build.zig"), "pub fn build() void {}\n");
+    write(
+        &root.join("main.zig"),
+        "const helper = @import(\"./helper.zig\");\npub fn caller() void { helper.work(); }\n",
+    );
+    write(&root.join("helper.zig"), "pub fn other() void {}\n");
+
+    let (initial, code) = run_in(
+        root,
+        &["callees", "caller", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "initial callees failed: {initial}");
+
+    write(
+        &root.join("helper.zig"),
+        "pub fn other() void {}\npub fn work() void {}\n",
+    );
+    let (updated, code) = run_in(root, &["callees", "caller", ".", "--json", "--compact"]);
+    assert_eq!(code, 0, "incremental callees failed: {updated}");
+    let updated_doc: serde_json::Value =
+        serde_json::from_str(updated.trim()).expect("incremental callees JSON");
+    let updated_edge = updated_doc["matches"]
+        .as_array()
+        .expect("incremental matches")
+        .iter()
+        .find(|edge| edge["kind"] == "call")
+        .expect("incremental call edge");
+    assert_eq!(updated_edge["target"], "helper.zig::work", "{updated}");
+    assert_eq!(updated_edge["confidence"], "Exact", "{updated}");
+
+    let (cold, code) = run_in(
+        root,
+        &["callees", "caller", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "cold callees failed: {cold}");
+    let cold_doc: serde_json::Value = serde_json::from_str(cold.trim()).expect("cold callees JSON");
+    let cold_edge = cold_doc["matches"]
+        .as_array()
+        .expect("cold matches")
+        .iter()
+        .find(|edge| edge["kind"] == "call")
+        .expect("cold call edge");
+    assert_eq!(updated_edge["target"], cold_edge["target"]);
+    assert_eq!(updated_edge["confidence"], cold_edge["confidence"]);
+}
+
+#[test]
+fn zig_namespace_import_removal_matches_cold_unresolved_result() {
+    let tmp = tempfile::tempdir().expect("temporary Zig project");
+    let root = tmp.path();
+    write(&root.join("build.zig"), "pub fn build() void {}\n");
+    write(
+        &root.join("main.zig"),
+        "const helper = @import(\"./helper.zig\");\npub fn caller() void { helper.work(); }\n",
+    );
+    write(&root.join("helper.zig"), "pub fn work() void {}\n");
+
+    let (initial, code) = run_in(
+        root,
+        &["callees", "caller", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "initial callees failed: {initial}");
+
+    write(
+        &root.join("helper.zig"),
+        "pub const Nested = struct { pub fn work() void {} };\n",
+    );
+    let (updated, code) = run_in(root, &["callees", "caller", ".", "--json", "--compact"]);
+    assert_eq!(code, 0, "incremental callees failed: {updated}");
+    let (cold, code) = run_in(
+        root,
+        &["callees", "caller", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "cold callees failed: {cold}");
+
+    assert_unresolved_zig_call(&updated, "work");
+    assert_unresolved_zig_call(&cold, "work");
+}
+
+#[test]
+fn zig_self_named_import_beats_same_file_homonym() {
+    let tmp = tempfile::tempdir().expect("temporary Zig project");
+    let root = tmp.path();
+    write(&root.join("build.zig"), "pub fn build() void {}\n");
+    write(
+        &root.join("main.zig"),
+        "const self = @import(\"./helper.zig\");\npub fn work() void {}\npub fn caller() void { self.work(); }\n",
+    );
+    write(&root.join("helper.zig"), "pub fn work() void {}\n");
+
+    let (out, code) = run_in(
+        root,
+        &["callees", "caller", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "callees failed: {out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("callees JSON");
+    let edge = doc["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .find(|edge| edge["kind"] == "call")
+        .expect("call edge");
+    assert_eq!(edge["target"], "helper.zig::work", "{out}");
+    assert_eq!(edge["confidence"], "Exact", "{out}");
+}
+
+#[test]
+fn zig_ordinary_receiver_incremental_result_matches_cold_build() {
+    let tmp = tempfile::tempdir().expect("temporary mixed-language project");
+    let root = tmp.path();
+    write(&root.join("build.zig"), "pub fn build() void {}\n");
+    write(
+        &root.join("main.zig"),
+        "const Thing = struct {};\npub fn caller(this: Thing) void { this.work(); }\n",
+    );
+    write(&root.join("other.rs"), "pub fn placeholder() {}\n");
+
+    let (initial, code) = run_in(
+        root,
+        &["callees", "caller", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "initial callees failed: {initial}");
+    assert_unresolved_zig_call(&initial, "work");
+
+    write(
+        &root.join("other.rs"),
+        "pub fn placeholder() {}\npub fn work() {}\n",
+    );
+    let (updated, code) = run_in(root, &["callees", "caller", ".", "--json", "--compact"]);
+    assert_eq!(code, 0, "incremental callees failed: {updated}");
+    let (cold, code) = run_in(
+        root,
+        &["callees", "caller", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "cold callees failed: {cold}");
+
+    assert_unresolved_zig_call(&updated, "work");
+    assert_unresolved_zig_call(&cold, "work");
+}
+
+#[test]
+fn zig_imported_construct_stays_unresolved_across_delta() {
+    let tmp = tempfile::tempdir().expect("temporary Zig project");
+    let root = tmp.path();
+    write(&root.join("build.zig"), "pub fn build() void {}\n");
+    write(
+        &root.join("main.zig"),
+        "const helper = @import(\"./helper.zig\");\npub fn make() void { _ = helper.Widget{}; }\n",
+    );
+    write(&root.join("helper.zig"), "pub const Widget = struct {};\n");
+
+    let (initial, code) = run_in(
+        root,
+        &["callees", "make", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "initial callees failed: {initial}");
+    let initial_doc: serde_json::Value =
+        serde_json::from_str(initial.trim()).expect("initial callees JSON");
+    let initial_edge = initial_doc["matches"]
+        .as_array()
+        .expect("initial matches")
+        .iter()
+        .find(|edge| edge["kind"] == "construct")
+        .expect("initial construct edge");
+    assert_eq!(initial_edge["target"], "[unresolved] Widget", "{initial}");
+
+    write(
+        &root.join("helper.zig"),
+        "pub const Widget = struct {};\npub const changed = true;\n",
+    );
+    let (updated, code) = run_in(root, &["callees", "make", ".", "--json", "--compact"]);
+    assert_eq!(code, 0, "incremental callees failed: {updated}");
+    let (cold, code) = run_in(
+        root,
+        &["callees", "make", ".", "--rebuild", "--json", "--compact"],
+    );
+    assert_eq!(code, 0, "cold callees failed: {cold}");
+
+    for output in [&updated, &cold] {
+        let doc: serde_json::Value = serde_json::from_str(output.trim()).expect("callees JSON");
+        let edge = doc["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .find(|edge| edge["kind"] == "construct")
+            .expect("construct edge");
+        assert_eq!(edge["target"], "[unresolved] Widget", "{output}");
+        assert_eq!(edge["confidence"], "Ambiguous", "{output}");
+    }
 }
 
 #[test]

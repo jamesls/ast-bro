@@ -1,9 +1,11 @@
 //! Three-pass resolver: bare call names → qualified targets.
 //!
-//! Pass A — same-file: a call site `foo()` resolves if `foo` is defined in
-//! the same file (a `Qn` we already collected) or if it appears in the
-//! file's `ImportBinding`s and the import's module spec resolves to a
-//! project file via the existing `src/deps/resolver` suffix index.
+//! Pass A — same-file/imports: a call site `foo()` resolves if `foo` is
+//! defined in the same file (a `Qn` we already collected) or imported
+//! directly. A Zig namespace call such as `helper.foo()` resolves when
+//! `helper` is an `ImportBinding`, its module spec maps to a project file,
+//! and that file defines a top-level `foo`. Both import forms reuse the
+//! existing `src/deps/resolver` suffix index.
 //!
 //! Pass B — global symbol-table: any remaining bare name with exactly one
 //! global qn match promotes to `Resolved(qn)`. Multiple matches defer.
@@ -96,7 +98,7 @@ pub fn run_with_table(
             // bind locally, and a type-qualified call (`Foo::bar()`,
             // `Foo.bar()`) binds only to a local qn actually scoped under
             // that type.
-            let self_like = receiver_is_self_like(raw.receiver.as_deref());
+            let self_like = receiver_is_self_like_for_lang(raw.receiver.as_deref(), lang);
             // `crate`/`super` name a *different* scope than the caller's
             // own: `crate::helper()` means the crate root and
             // `super::helper()` the parent module, never a sibling. Route
@@ -105,9 +107,53 @@ pub fn run_with_table(
             // caller-scope homonym tagged Exact. (In OO languages a bare
             // `super.m()` receiver names the parent type — also never the
             // caller's own scope.)
-            let scope_shifting = receiver_is_scope_shifting(raw.receiver.as_deref());
+            let scope_shifting =
+                lang != Some(Lang::Zig) && receiver_is_scope_shifting(raw.receiver.as_deref());
 
-            // -------- Pass A: same-file -------- //
+            // -------- Pass A: Zig namespace import resolution -------- //
+            // A Zig `@import` binding names the receiver rather than the
+            // callee: `const helper = @import("./helper.zig"); helper.work()`.
+            // Check it before generic same-file handling because Zig permits
+            // imports named `self`, `Self`, `this`, `cls`, `crate`, or `super`;
+            // those spellings are self-like only in other languages. Require
+            // a real top-level callable in the target file and consume the
+            // edge even on failure. Falling through would let pass C bind a
+            // nested same-name method in that file.
+            if lang == Some(Lang::Zig) {
+                if let Some(receiver) = raw.receiver.as_deref() {
+                    if let Some(spec) = import_lookup.get(receiver) {
+                        let target = resolve_via_imports(
+                            spec,
+                            &raw.bare_name,
+                            &fp.file,
+                            lang,
+                            &aliases,
+                            &suffix_idx,
+                            root,
+                            &symbol_table,
+                            false,
+                        );
+                        let (target, confidence) = match target {
+                            Some(target) => (CallTarget::Resolved(target), Confidence::Exact),
+                            None => (
+                                CallTarget::Bare(raw.bare_name.clone()),
+                                Confidence::Ambiguous,
+                            ),
+                        };
+                        let edge = raw_to_edge(
+                            raw.clone(),
+                            target,
+                            confidence,
+                            rel_path(root, &fp.file),
+                            Vec::new(),
+                        );
+                        forward.entry(edge.source.clone()).or_default().push(edge);
+                        continue;
+                    }
+                }
+            }
+
+            // -------- Pass A (cont): same-file -------- //
             if file_qns.contains(&raw.bare_name) {
                 let local_target = if self_like && !scope_shifting {
                     // Prefer the sibling under the caller's own scope:
@@ -286,7 +332,7 @@ pub fn run_with_table(
                 // through to pass B/C rather than mis-bind.
             }
 
-            // -------- Pass A (cont): import resolution -------- //
+            // -------- Pass A (cont): direct import resolution -------- //
             // Same gate: `obj.parse()` must not bind to an imported free
             // function `parse`. Scope-shifting receivers bypass imports too:
             // `crate::helper()` explicitly names a path, not the imported
@@ -302,6 +348,7 @@ pub fn run_with_table(
                         &suffix_idx,
                         root,
                         &symbol_table,
+                        true,
                     ) {
                         let edge = raw_to_edge(
                             raw.clone(),
@@ -429,6 +476,18 @@ pub(crate) fn receiver_is_self_like(recv: Option<&str>) -> bool {
     )
 }
 
+/// Apply the receiver spelling rules for a specific source language.
+///
+/// Zig uses `self` and `Self` by convention. The other generic spellings are
+/// ordinary Zig identifiers and must retain explicit-object semantics.
+pub(crate) fn receiver_is_self_like_for_lang(recv: Option<&str>, lang: Option<Lang>) -> bool {
+    if lang == Some(Lang::Zig) {
+        matches!(recv, None | Some("self") | Some("Self"))
+    } else {
+        receiver_is_self_like(recv)
+    }
+}
+
 /// A scope-keyword receiver that names a scope *other than* the caller's
 /// own — the refinement pass A and pass B apply on top of
 /// [`receiver_is_self_like`] (see its doc). Keyword *chains*
@@ -452,6 +511,7 @@ fn resolve_via_imports(
     idx: &crate::deps::resolver::SuffixIndex,
     root: &Path,
     symbol_table: &HashMap<String, Vec<Qn>>,
+    allow_fallback: bool,
 ) -> Option<Qn> {
     let lang = lang?;
     let ctx = ResolveCtx {
@@ -462,18 +522,31 @@ fn resolve_via_imports(
     };
     let target_file = resolve_spec(spec, &ctx, idx)?;
     let rel = file_rel(root, &target_file);
+    let file_scope_qn = format!("{}::{}", rel, bare_name);
 
-    // Prefer a qn whose file matches the resolved target.
+    // A namespace member names the imported file's top-level declaration.
+    // Prefer that exact qn before considering any legacy direct-import
+    // fallback; symbol-table ordering must not turn `helper.work()` into
+    // `helper.zig::SomeType::work`.
     if let Some(cands) = symbol_table.get(bare_name) {
+        if let Some(cand) = cands.iter().find(|cand| cand.as_str() == file_scope_qn) {
+            return Some(cand.clone());
+        }
+        if !allow_fallback {
+            return None;
+        }
         for cand in cands {
             if cand.file() == rel {
                 return Some(cand.clone());
             }
         }
     }
+    if !allow_fallback {
+        return None;
+    }
     // Fall back: synthesize a file-scope qn (not always correct for nested
     // declarations, but better than dropping the edge).
-    Some(Qn::new(format!("{}::{}", rel, bare_name)))
+    Some(Qn::new(file_scope_qn))
 }
 
 /// Per-file forward-dep closures, memoized. A file's closure is the same for
@@ -550,6 +623,130 @@ fn forward_closure_files(deps: &DepGraph, from: &Path) -> HashSet<PathBuf> {
 }
 
 fn rel_path(root: &Path, file: &Path) -> PathBuf {
-    file.strip_prefix(root).map(|p| p.to_path_buf()).unwrap_or_else(|_| file.to_path_buf())
+    file.strip_prefix(root)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|_| file.to_path_buf())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calls::graph::CallKindCompat;
+    use crate::core::ImportBinding;
+
+    fn empty_pass(file: PathBuf, defined: Vec<Qn>) -> FilePass {
+        FilePass {
+            file,
+            defined,
+            callable_locations: Vec::new(),
+            imports: Vec::new(),
+            raw_edges: Vec::new(),
+            types: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn namespace_import_receiver_resolves_exactly_despite_homonyms() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let root = dir.path();
+        let main_file = root.join("main.zig");
+        let helper_file = root.join("helper.zig");
+        let decoy_file = root.join("decoy.zig");
+        std::fs::write(
+            &main_file,
+            "const helper = @import(\"./helper.zig\");\npub fn caller() void { helper.work(); }\n",
+        )
+        .expect("write Zig caller");
+        std::fs::write(&helper_file, "pub fn work() void {}\n").expect("write imported Zig file");
+        std::fs::write(&decoy_file, "pub fn work() void {}\n").expect("write decoy Zig file");
+
+        let source = Qn::new("main.zig::caller");
+        let mut main = empty_pass(main_file, vec![source.clone(), Qn::new("main.zig::work")]);
+        main.imports.push(ImportBinding {
+            local: "helper".to_string(),
+            module: "./helper.zig".to_string(),
+            line: 1,
+        });
+        main.raw_edges.push(RawEdge {
+            source: source.clone(),
+            bare_name: "work".to_string(),
+            receiver: Some("helper".to_string()),
+            kind: CallKindCompat::Call,
+            line: 2,
+        });
+
+        let helper = empty_pass(
+            helper_file,
+            vec![
+                Qn::new("helper.zig::Nested::work"),
+                Qn::new("helper.zig::work"),
+            ],
+        );
+        let decoy = empty_pass(decoy_file, vec![Qn::new("decoy.zig::work")]);
+        let deps = DepGraph::empty(root.to_path_buf());
+
+        let resolved = run(root, &deps, vec![main, helper, decoy]);
+        let edge = resolved
+            .forward
+            .get(&source)
+            .and_then(|edges| edges.first())
+            .expect("caller edge");
+
+        assert_eq!(edge.confidence, Confidence::Exact);
+        match &edge.target {
+            CallTarget::Resolved(target) => {
+                assert_eq!(target, &Qn::new("helper.zig::work"));
+            }
+            target => panic!("expected resolved namespace call, got {}", target.display()),
+        }
+    }
+
+    #[test]
+    fn namespace_import_does_not_bind_nested_or_invented_target() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let root = dir.path();
+        let main_file = root.join("main.zig");
+        let helper_file = root.join("helper.zig");
+        std::fs::write(
+            &main_file,
+            "const helper = @import(\"./helper.zig\");\npub fn caller() void { helper.work(); }\n",
+        )
+        .expect("write Zig caller");
+        std::fs::write(
+            &helper_file,
+            "pub const Nested = struct { pub fn work() void {} };\n",
+        )
+        .expect("write imported Zig file");
+
+        let source = Qn::new("main.zig::caller");
+        let mut main = empty_pass(main_file, vec![source.clone()]);
+        main.imports.push(ImportBinding {
+            local: "helper".to_string(),
+            module: "./helper.zig".to_string(),
+            line: 1,
+        });
+        main.raw_edges.push(RawEdge {
+            source: source.clone(),
+            bare_name: "work".to_string(),
+            receiver: Some("helper".to_string()),
+            kind: CallKindCompat::Call,
+            line: 2,
+        });
+        let helper = empty_pass(helper_file, vec![Qn::new("helper.zig::Nested::work")]);
+
+        let resolved = run(
+            root,
+            &DepGraph::empty(root.to_path_buf()),
+            vec![main, helper],
+        );
+        let edge = resolved
+            .forward
+            .get(&source)
+            .and_then(|edges| edges.first())
+            .expect("caller edge");
+
+        assert!(matches!(&edge.target, CallTarget::Bare(name) if name == "work"));
+        assert_eq!(edge.confidence, Confidence::Ambiguous);
+        assert!(edge.candidates.is_empty());
+    }
+}

@@ -1,7 +1,7 @@
 //! Disk persistence for the unified `UnifiedGraph` at
 //! `.ast-bro/deps/graph.bin`. Replaces the previous `src/deps/cache.rs`
-//! which serialized only `DepGraph`. Schema bump from `deps-index.v1` to
-//! `graph-index.v1` forces a one-time rebuild for upgrading users.
+//! which serialized only `DepGraph`. Schema mismatches force a one-time
+//! rebuild for upgrading users.
 //!
 //! Mirrors the search-index pattern in `src/search/cache.rs`: mtime/size/
 //! xxhash3 delta detection, advisory `fs2` lock, atomic `.tmp` + rename.
@@ -269,6 +269,7 @@ pub fn collect_file_records(root: &Path) -> std::io::Result<Vec<FileRecord>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deps::DepGraph;
     use crate::graph_cache::shared;
 
     fn write(p: &Path, body: &str) {
@@ -276,6 +277,23 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn graph_index_v1_cache_is_invalidated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = cache_path(root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let stale = CacheFile {
+            schema: "ast-bro.graph-index.v1".to_string(),
+            graph: UnifiedGraph::from_deps(DepGraph::empty(root.to_path_buf())),
+            files: Vec::new(),
+        };
+        let bytes = encode_to_vec(&stale, bincode::config::standard()).unwrap();
+        fs::write(path, bytes).unwrap();
+
+        assert!(matches!(load_with_delta(root), LoadOutcome::Missing));
     }
 
     /// Cold build → on-disk cache has `calls: None`. After `promote_calls`,

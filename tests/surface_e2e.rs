@@ -6,7 +6,8 @@
 //! re-export chains, etc.) rather than full snapshots — snapshots are
 //! brittle to colour/whitespace changes and these are quick to read.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> PathBuf {
@@ -26,6 +27,13 @@ fn surface(args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).expect("utf8 stdout")
+}
+
+fn write(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create fixture directory");
+    }
+    fs::write(path, contents).expect("write fixture file");
 }
 
 #[test]
@@ -105,6 +113,28 @@ fn java_fallback_filters_visibility() {
     assert!(s.contains("Greeter"), "public class missing:\n{s}");
     assert!(s.contains("greet"), "public method missing:\n{s}");
     assert!(!s.contains("internal"), "private method leaked:\n{s}");
+}
+
+#[test]
+fn build_zig_root_wins_over_nested_cargo_manifest() {
+    let tmp = tempfile::tempdir().expect("create temp directory");
+    write(&tmp.path().join("build.zig"), "pub fn zigRoot() void {}\n");
+    write(
+        &tmp.path().join("nested/Cargo.toml"),
+        "[package]\nname = \"nested\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        &tmp.path().join("nested/src/lib.rs"),
+        "pub fn rust_hijack() {}\n",
+    );
+
+    let root = tmp.path().to_str().expect("UTF-8 temp path");
+    let output = surface(&["surface", root]);
+
+    assert!(
+        output.contains("zigRoot"),
+        "root build.zig was hijacked by nested Cargo.toml:\n{output}"
+    );
 }
 
 #[test]

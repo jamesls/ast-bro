@@ -11,8 +11,8 @@
 //!
 //! Why keep the `deps/` directory name even though it now holds the call
 //! graph too: renaming would force every existing user to rebuild from a new
-//! path. The schema bump (`deps-index.v1` → `graph-index.v1`) already forces
-//! a rebuild; further moving the file is unnecessary churn.
+//! path. Schema migrations already force a rebuild, so moving the file would
+//! add unnecessary churn.
 
 pub mod cache;
 pub mod delta;

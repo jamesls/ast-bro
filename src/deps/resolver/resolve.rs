@@ -263,6 +263,13 @@ pub fn resolve(spec: &str, ctx: &ResolveCtx<'_>, idx: &SuffixIndex) -> Option<Pa
         return None;
     }
 
+    // Zig's bare names (`std`, `builtin`, `root`, and build-script modules)
+    // are not filesystem paths and cannot be resolved without evaluating
+    // `build.zig`.
+    if ctx.lang == Lang::Zig {
+        return None;
+    }
+
     // Python `from a.b import c` arrives normalised to `a/b/c` already.
     let key = spec.replace('.', "/");
     pick_closest(idx.lookup(&key), ctx.from_file)
@@ -287,7 +294,17 @@ fn resolve_relative_path(
     // Strip a known extension if present.
     let target = cur.join(remaining);
     if target.is_file() {
-        return Some(target);
+        return Some(if ctx.lang == Lang::Zig {
+            normalize_lexically(&target)
+        } else {
+            target
+        });
+    }
+    // Zig file imports include their `.zig` extension explicitly. Do not
+    // probe extensions or consult the suffix index when that direct path is
+    // absent; all other Zig specs are named modules handled as external.
+    if ctx.lang == Lang::Zig {
+        return None;
     }
     // Try common extensions for TS/JS.
     if matches!(
@@ -348,6 +365,28 @@ fn resolve_relative_path(
         Err(_) => target.display().to_string(),
     };
     pick_closest(idx.lookup(&rel), ctx.from_file)
+}
+
+/// Removes `.` and interior `..` components without resolving symlinks.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::ParentDir) | None => normalized.push(".."),
+                Some(Component::CurDir) => unreachable!("curdir components are not retained"),
+            },
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn with_ext(p: &Path, ext: &str) -> PathBuf {
@@ -445,4 +484,38 @@ fn pick_closest(candidates: Option<&[PathBuf]>, from_file: &Path) -> Option<Path
         }
     }
     best.map(|(_, p)| p.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deps::resolver::build::build_suffix_index;
+
+    #[test]
+    fn zig_only_resolves_existing_explicit_relative_files() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let importer = dir.path().join("sub/main.zig");
+        let imported = dir.path().join("helper.zig");
+        let sibling = dir.path().join("sub/sibling.zig");
+        std::fs::create_dir_all(importer.parent().expect("importer parent"))
+            .expect("create Zig source directory");
+        std::fs::create_dir(importer.parent().expect("importer parent").join("nested"))
+            .expect("create nested Zig source directory");
+        std::fs::write(&importer, "const helper = @import(\"helper.zig\");")
+            .expect("write Zig importer");
+        std::fs::write(&imported, "pub fn help() void {}").expect("write imported Zig file");
+        std::fs::write(&sibling, "pub fn sibling() void {}").expect("write sibling Zig file");
+        let idx = build_suffix_index(dir.path());
+        let ctx = ResolveCtx::new(&importer, Lang::Zig);
+
+        assert_eq!(resolve("../helper.zig", &ctx, &idx), Some(imported));
+        assert_eq!(resolve("./sibling.zig", &ctx, &idx), Some(sibling));
+        assert_eq!(
+            resolve("./nested/../sibling.zig", &ctx, &idx),
+            Some(dir.path().join("sub/sibling.zig"))
+        );
+        assert_eq!(resolve("./helper", &ctx, &idx), None);
+        assert_eq!(resolve("helper", &ctx, &idx), None);
+        assert_eq!(resolve("std", &ctx, &idx), None);
+    }
 }

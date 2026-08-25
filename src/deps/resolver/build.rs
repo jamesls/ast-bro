@@ -44,6 +44,7 @@ pub enum Lang {
     Cpp,
     Php,
     Ruby,
+    Zig,
     Other,
 }
 
@@ -65,6 +66,7 @@ impl Lang {
             "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hxx" | "hh" | "h++" | "h" => Self::Cpp,
             "php" => Self::Php,
             "rb" => Self::Ruby,
+            "zig" => Self::Zig,
             _ => return None,
         };
         // `Cargo.toml`/`go.mod` etc. don't go through here.
@@ -393,4 +395,15 @@ fn pick_after(line: &str, keywords: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_path_recognizes_zig_source_files() {
+        assert_eq!(Lang::from_path(Path::new("src/main.zig")), Some(Lang::Zig));
+        assert_eq!(Lang::from_path(Path::new("build.zig.zon")), None);
+    }
 }

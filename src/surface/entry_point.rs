@@ -4,7 +4,8 @@
 //!   1. `Cargo.toml` (workspace or single crate)
 //!   2. `pyproject.toml` (Python package)
 //!   3. `__init__.py` directly in the dir (Python package without manifest)
-//!   4. Fallback: walk the dir and let the per-file visibility filter run.
+//!   4. Known fallback manifests such as `build.zig`
+//!   5. Fallback: walk the dir and let the per-file visibility filter run.
 //!
 //! When given a file, dispatch by name/extension instead.
 
@@ -140,11 +141,12 @@ fn discover_dir(dir: &Path) -> Result<EntryPoint, SurfaceError> {
     if _has_scala_file(dir) {
         return discover_scala(dir);
     }
-    // PHP / Ruby / C++ have no `pub use`-style re-export semantics, so
+    // Zig / PHP / Ruby / C++ have no `pub use`-style re-export semantics, so
     // there's no meaningful per-language surface resolver. Recognise their
     // manifests so we route to Fallback explicitly (and skip the deeper
     // probe below) rather than missing the dir entirely.
-    if dir.join("composer.json").is_file()
+    if dir.join("build.zig").is_file()
+        || dir.join("composer.json").is_file()
         || dir.join("Gemfile").is_file()
         || dir.join("CMakeLists.txt").is_file()
     {

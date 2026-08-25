@@ -226,6 +226,35 @@ fn mcp_find_related_unknown_location_is_an_error_in_json_mode_too() {
 }
 
 #[test]
+fn mcp_run_zig_language_error_explains_ast_grep_limitation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resp = call_tool(
+        tmp.path(),
+        "run",
+        serde_json::json!({"pattern": "fn $F() {}", "lang": "zig"}),
+    );
+    let (_, is_error, text) = result_of(&resp);
+    assert!(is_error, "unsupported language must be an error: {resp}");
+    assert_eq!(
+        text,
+        "zig is not supported by run: ast-grep has no Zig grammar"
+    );
+}
+
+#[test]
+fn mcp_run_unknown_language_keeps_generic_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resp = call_tool(
+        tmp.path(),
+        "run",
+        serde_json::json!({"pattern": "fn $F() {}", "lang": "brainfuck"}),
+    );
+    let (_, is_error, text) = result_of(&resp);
+    assert!(is_error, "unsupported language must be an error: {resp}");
+    assert_eq!(text, "unsupported language 'brainfuck'");
+}
+
+#[test]
 fn mcp_callees_limit_truncates_display_but_keeps_the_true_total() {
     // `limit` bounds the payload, not the walk (issue #32): the JSON must
     // carry the exact pre-cap `total` and `truncated: true` so a consumer

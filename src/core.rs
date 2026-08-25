@@ -28,7 +28,7 @@ pub const JSON_SCHEMA_RUN: &str = "ast-bro.run.v1";
 /// were silently un-decodable (the loader returned `None` and rebuilt
 /// every time, masking the bug). The v2 bump ensures upgrading users get
 /// a clean rebuild rather than continuing to hit the silent fallback.
-pub const JSON_SCHEMA_GRAPH_INDEX: &str = "ast-bro.graph-index.v1";
+pub const JSON_SCHEMA_GRAPH_INDEX: &str = "ast-bro.graph-index.v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Default)]
 pub enum DeclarationKind {
@@ -450,6 +450,14 @@ fn _modifiers(d: &Declaration, lang: &str) -> Vec<String> {
         ],
         "scala" => &["sealed", "final", "abstract", "implicit", "inline", "lazy", "override"],
         "csharp" => &["partial", "sealed", "static", "abstract", "virtual", "override", "async"],
+        "zig" => &[
+            "export",
+            "extern",
+            "inline",
+            "noinline",
+            "threadlocal",
+            "comptime",
+        ],
         _ => &[],
     };
     if want.is_empty() {
@@ -467,6 +475,7 @@ fn _modifiers(d: &Declaration, lang: &str) -> Vec<String> {
         "kotlin" => &["fun", "class", "interface", "object", "enum", "val", "var"],
         "scala" => &["def", "class", "trait", "object", "val", "var", "type"],
         "csharp" => &["class", "interface", "struct", "record", "enum", "void"],
+        "zig" => &["fn", "const", "var", "test", "struct", "enum", "union"],
         _ => &[],
     };
 

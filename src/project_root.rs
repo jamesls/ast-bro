@@ -116,6 +116,7 @@ pub fn find_root_for(file: &Path) -> Result<PathBuf, String> {
         "build.gradle",
         "build.gradle.kts",
         "build.sbt",
+        "build.zig",
         "pom.xml",
     ];
     let home = home_dir();
@@ -318,6 +319,17 @@ mod tests {
         touch(&proj.join("src/lib.rs"));
 
         let root = find_root_for(&proj.join("src/lib.rs")).unwrap();
+        assert_eq!(root, proj.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn find_root_recognizes_build_zig() {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        touch(&proj.join("build.zig"));
+        touch(&proj.join("src/main.zig"));
+
+        let root = find_root_for(&proj.join("src/main.zig")).unwrap();
         assert_eq!(root, proj.canonicalize().unwrap());
     }
 

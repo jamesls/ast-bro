@@ -2,10 +2,8 @@ use crate::core::{Declaration, DeclarationKind, ParseResult};
 use std::path::Path;
 
 pub fn parse_markdown(path: &Path, source: &[u8]) -> ParseResult {
-    // Instead of implementing Language and LanguageExt, we can use ast_grep_core::tree_sitter directly
-    // to just parse the AST and build a mock Root or Node.
-    // However, to keep it simple and fit the architecture, we will use Html SupportLang
-    // to get a generic Doc instance and parse manually using tree_sitter-md.
+    // Markdown is not available through ast-grep's `SupportLang`, so this
+    // adapter parses it directly and walks raw `tree_sitter::Node`s.
 
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -20,8 +18,7 @@ pub fn parse_markdown(path: &Path, source: &[u8]) -> ParseResult {
         decls.push(fm);
     }
 
-    // Instead of ast_grep Nodes, we have to use tree_sitter nodes and convert manually
-    // or implement the full tree-sitter walk without ast_grep abstraction for this one file.
+    // Convert the tree-sitter nodes directly into the shared declaration IR.
     _walk_ts(tree.root_node(), source, &mut decls);
 
     ParseResult {

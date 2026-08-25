@@ -8,7 +8,9 @@
 
 use ast_grep_core::{Doc, Node};
 use ast_grep_language::{LanguageExt, SupportLang};
+use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use crate::deps::graph::ImportKind;
 use crate::deps::resolver::build::Lang;
@@ -49,6 +51,7 @@ pub fn extract(path: &Path, lang: Lang) -> Vec<RawImport> {
         Lang::Cpp => extract_cpp(&src),
         Lang::Php => extract_php(&src),
         Lang::Ruby => extract_ruby(&src),
+        Lang::Zig => extract_zig(&src),
         Lang::Other => Vec::new(),
     }
 }
@@ -1037,6 +1040,52 @@ fn consume_ruby_call<'a, D: Doc>(node: &Node<'a, D>, out: &mut Vec<RawImport>) {
     }
 }
 
+// ---- Zig ----
+
+static ZIG_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?x)
+        (?:
+            \bconst\s+
+            (?P<local>[A-Za-z_][A-Za-z0-9_]*)
+            (?:\s*:[^=]+)?
+            \s*=\s*
+        )?
+        @import\s*\(\s*"(?P<spec>[^"\r\n]+)"\s*\)
+        "#,
+    )
+    .expect("Zig import regex must compile")
+});
+
+fn extract_zig(src: &str) -> Vec<RawImport> {
+    let mut out = Vec::new();
+    for (line_index, raw_line) in src.lines().enumerate() {
+        for captures in ZIG_IMPORT_RE.captures_iter(raw_line) {
+            let Some(spec_match) = captures.name("spec") else {
+                continue;
+            };
+            let raw_spec = spec_match.as_str();
+            let spec = if raw_spec.ends_with(".zig")
+                && !raw_spec.starts_with("./")
+                && !raw_spec.starts_with("../")
+            {
+                format!("./{raw_spec}")
+            } else {
+                raw_spec.to_string()
+            };
+            out.push(RawImport {
+                spec,
+                kind: ImportKind::Bare,
+                line: (line_index + 1) as u32,
+                statement: raw_line.trim().to_string(),
+                local_name: captures.name("local").map(|m| m.as_str().to_string()),
+                raw_path: Some(raw_spec.to_string()),
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,5 +1116,37 @@ mod tests {
         assert_eq!(strip_quotes(""), "");
         // Mismatched delimiters: only `"x'` doesn't qualify as paired.
         assert_eq!(strip_quotes("\"x'"), "\"x'");
+    }
+
+    #[test]
+    fn zig_imports_capture_bindings_and_normalize_file_paths() {
+        let imports = extract_zig(
+            r#"const std = @import("std");
+pub const helper = @import("lib/helper.zig");
+const sibling = @import("../sibling.zig");
+const Types: type = @import("types.zig");
+const payload = @embedFile("asset.zig");"#,
+        );
+
+        assert_eq!(imports.len(), 4);
+        assert_eq!(imports[0].spec, "std");
+        assert_eq!(imports[0].local_name.as_deref(), Some("std"));
+        assert_eq!(imports[0].line, 1);
+        assert_eq!(imports[1].spec, "./lib/helper.zig");
+        assert_eq!(imports[1].local_name.as_deref(), Some("helper"));
+        assert_eq!(imports[2].spec, "../sibling.zig");
+        assert_eq!(imports[3].spec, "./types.zig");
+        assert_eq!(imports[3].local_name.as_deref(), Some("Types"));
+        assert_eq!(imports[3].raw_path.as_deref(), Some("types.zig"));
+    }
+
+    #[test]
+    fn zig_imports_emit_every_unbound_call() {
+        let imports = extract_zig(r#"comptime { _ = @import("first"); _ = @import("second"); }"#);
+
+        assert_eq!(imports.len(), 2);
+        assert!(imports.iter().all(|import| import.local_name.is_none()));
+        assert_eq!(imports[0].spec, "first");
+        assert_eq!(imports[1].spec, "second");
     }
 }

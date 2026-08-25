@@ -311,6 +311,100 @@ fn cache_round_trip_returns_same_graph() {
     assert_eq!(edges1, edges2);
 }
 
+// ---- Zig ----
+
+#[test]
+fn zig_relative_import_resolves() {
+    let s = run_ok(&[
+        "deps",
+        "tests/fixtures/deps/zig_relative/main.zig",
+        "--depth",
+        "1",
+        "--rebuild",
+    ]);
+    assert!(s.contains("sub/b.zig"), "expected sub/b.zig in deps:\n{s}");
+    assert!(
+        !s.contains("std.zig"),
+        "named std module resolved to a local homonym:\n{s}"
+    );
+}
+
+#[test]
+fn zig_reverse_deps_finds_importer() {
+    let s = run_ok(&[
+        "reverse-deps",
+        "tests/fixtures/deps/zig_relative/sub/b.zig",
+        "--depth",
+        "1",
+        "--rebuild",
+    ]);
+    assert!(s.contains("main.zig"), "expected main.zig as importer:\n{s}");
+}
+
+#[test]
+fn zig_named_import_is_external() {
+    let s = run_ok(&[
+        "graph",
+        "tests/fixtures/deps/zig_relative",
+        "--include-external",
+        "--json",
+        "--rebuild",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&s).expect("graph JSON");
+    let externals = value["external"].as_array().expect("external array");
+    assert!(
+        externals.iter().any(|entry| {
+            entry["from"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("main.zig"))
+                && entry["spec"] == "std"
+        }),
+        "expected std as an external Zig import: {s}"
+    );
+}
+
+#[test]
+fn zig_cycle_is_detected() {
+    let (code, stdout, stderr) = run(&[
+        "cycles",
+        "tests/fixtures/deps/zig_relative/cycle",
+        "--rebuild",
+    ]);
+    assert_eq!(code, 3, "expected cycle exit 3:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("a.zig"), "missing a.zig:\n{stdout}");
+    assert!(stdout.contains("b.zig"), "missing b.zig:\n{stdout}");
+}
+
+#[test]
+fn zig_edit_invalidates_the_dependency_cache() {
+    let tmp = tempfile::tempdir().expect("temporary Zig project");
+    let root = tmp.path();
+    std::fs::write(root.join("a.zig"), "pub const value = 1;\n").expect("write a.zig");
+    std::fs::write(root.join("b.zig"), "pub const value = 22;\n").expect("write b.zig");
+    std::fs::write(
+        root.join("main.zig"),
+        "const target = @import(\"./a.zig\");\npub fn run() usize { return target.value; }\n",
+    )
+    .expect("write initial main.zig");
+
+    let (code, first, stderr) = run_in(root, &["deps", "main.zig", "--rebuild"]);
+    assert_eq!(code, 0, "prime cache failed:\n{first}\n{stderr}");
+    assert!(first.contains("a.zig"), "initial edge missing:\n{first}");
+
+    // The size change guarantees the cheap `(mtime, size)` comparison notices
+    // the edit even on filesystems with coarse timestamp resolution.
+    std::fs::write(
+        root.join("main.zig"),
+        "const target = @import(\"./b.zig\");\npub fn run() usize { return target.value; } // changed\n",
+    )
+    .expect("rewrite main.zig");
+
+    let (code, second, stderr) = run_in(root, &["deps", "main.zig"]);
+    assert_eq!(code, 0, "cached query failed:\n{second}\n{stderr}");
+    assert!(second.contains("b.zig"), "new edge missing:\n{second}");
+    assert!(!second.contains("a.zig"), "stale edge survived:\n{second}");
+}
+
 // ---- PHP ----
 
 #[test]

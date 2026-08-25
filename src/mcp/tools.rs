@@ -1070,7 +1070,9 @@ fn run_run(args: Value) -> CallResult {
     let (fixed_lang, compiled_pattern) = if let Some(ref l) = a.lang {
         let lang = match crate::run::cli::parse_lang(l) {
             Some(l) => l,
-            None => return CallResult::Error(format!("unsupported language '{}'", l)),
+            None => {
+                return CallResult::Error(crate::run::cli::unsupported_language_message(l));
+            }
         };
         let pat = match ast_grep_core::Pattern::try_new(&a.pattern, lang) {
             Ok(p) => p,

@@ -413,6 +413,29 @@ fn run_with_no_paths_still_defaults_to_the_current_directory() {
 }
 
 #[test]
+fn run_zig_language_error_explains_ast_grep_limitation() {
+    let (code, stdout, stderr) = run(&["run", "-p", "fn $F() {}", "--lang", "zig"]);
+    assert_eq!(code, Some(2), "stderr:\n{stderr}");
+    assert!(stdout.is_empty(), "stdout must be empty:\n{stdout}");
+    assert!(
+        stderr.contains("zig is not supported by run: ast-grep has no Zig grammar"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_unknown_language_keeps_generic_error() {
+    let (code, stdout, stderr) = run(&["run", "-p", "fn $F() {}", "--lang", "brainfuck"]);
+    assert_eq!(code, Some(2), "stderr:\n{stderr}");
+    assert!(stdout.is_empty(), "stdout must be empty:\n{stdout}");
+    assert!(
+        stderr.contains("unsupported language 'brainfuck'"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("Zig grammar"), "stderr:\n{stderr}");
+}
+
+#[test]
 fn search_unresolved_path_is_a_rejection() {
     let (code, stdout, stderr) = run(&["search", "zzz", "./ast-bro-no-such-dir-xyz", "--json"]);
     assert_eq!(code, Some(2), "stderr:\n{stderr}");

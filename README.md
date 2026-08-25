@@ -1,8 +1,8 @@
 # ast-bro
 
-Fast, AST-based **code-navigation toolkit** for source files — surface the *shape* of a file (signatures with line numbers, no method bodies), the *true public API* of a package, the *dependency graph* between files, the *call graph* between symbols, search the repo by *symbol* or *behaviour*, the *blast radius* of touching a symbol, a *token-budgeted context pack* for any symbol, and *squeeze* repetitive logs into a smaller, reversible form. Nineteen analysis subcommands, one binary, built for LLM coding agents and humans who’d rather not waste tokens reading every file just to understand a codebase.
+[ast-bro](https://github.com/aeroxy/ast-bro) is an AST-based **code-navigation toolkit**. It maps file structure, resolves public APIs, builds dependency and call graphs, searches by symbol or behaviour, estimates change impact, packs context to a token budget, and compresses repetitive logs. Nineteen analysis subcommands serve coding agents and humans from one binary.
 
-[ast-bro](https://github.com/aeroxy/ast-bro) is written in Rust and uses [ast-grep](https://github.com/ast-grep/ast-grep)’s incredibly fast [tree-sitter](https://github.com/tree-sitter/tree-sitter) bindings. Thanks to [rayon](https://github.com/rayon-rs/rayon), it parses your entire workspace concurrently—often in milliseconds. For Google- or ByteDance-scale monorepos, [ast-bro](https://github.com/aeroxy/ast-bro) benefits from the additional abstraction layer provided by [repolayer](https://github.com/zhousiyao03-cyber/repolayer).
+[ast-bro](https://github.com/aeroxy/ast-bro) is written in Rust and uses [tree-sitter](https://github.com/tree-sitter/tree-sitter), usually through [ast-grep](https://github.com/ast-grep/ast-grep)'s bindings. [rayon](https://github.com/rayon-rs/rayon) parses workspace files concurrently. Large monorepos can add the abstraction layer provided by [repolayer](https://github.com/zhousiyao03-cyber/repolayer).
 
 [![crates.io](https://img.shields.io/crates/v/ast-bro.svg)](https://crates.io/crates/ast-bro)
 [![npm](https://img.shields.io/npm/v/@ast-bro/cli)](https://www.npmjs.com/package/@ast-bro/cli)
@@ -10,9 +10,9 @@ Fast, AST-based **code-navigation toolkit** for source files — surface the *sh
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/aeroxy/ast-bro)
 
-> **Renamed from `ast-outline` (v2.1.x and earlier).** The project outgrew "outline" — it now ships dep graphs, call graphs, hybrid semantic search, true public API resolution, and a structural search/rewrite engine, not just structural outlining. The old name also collided with an unrelated [VS Code extension](https://marketplace.visualstudio.com/items?itemName=cancerberosgx.vscode-typescript-ast-outline) and an [npm package](https://www.npmjs.com/package/ast-outline) — too generic to keep.
+> **Renamed from `ast-outline` (v2.1.x and earlier).** The project now includes dep graphs, call graphs, hybrid semantic search, public API resolution, and structural search and rewrite. The old name also collided with an unrelated [VS Code extension](https://marketplace.visualstudio.com/items?itemName=cancerberosgx.vscode-typescript-ast-outline) and an [npm package](https://www.npmjs.com/package/ast-outline).
 >
-> **Upgrading from `ast-outline`?** Run any `ast-bro` command once and it will auto-migrate `.ast-outline/` → `.ast-bro/` (cache), `.ast-outline-ignore` → `.ast-bro-ignore` (per-repo filter), `~/.cache/ast-outline/` → `~/.cache/ast-bro/` (model cache), and any `ast-outline` entries in your MCP config → `ast-bro`. The legacy `ast-outline` binary is still installed as a thin proxy that execs into `ast-bro`, and a shorter `sb` alias ships alongside, so existing scripts keep working.
+> **Upgrading from `ast-outline`?** Run any `ast-bro` command once and it will auto-migrate `.ast-outline/` -> `.ast-bro/` (cache), `.ast-outline-ignore` -> `.ast-bro-ignore` (per-repo filter), `~/.cache/ast-outline/` -> `~/.cache/ast-bro/` (model cache), and any `ast-outline` entries in your MCP config -> `ast-bro`. The legacy `ast-outline` binary is still installed as a thin proxy that execs into `ast-bro`, and a shorter `sb` alias ships alongside, so existing scripts keep working.
 
 ---
 
@@ -21,19 +21,19 @@ Fast, AST-based **code-navigation toolkit** for source files — surface the *sh
 **[ast-bro](https://github.com/aeroxy/ast-bro) exists to make LLM coding agents faster, cheaper, and smarter
 when navigating unfamiliar code.**
 
-Modern agentic coding tools explore codebases by reading files directly. That's reliable but has a massive cost: on a 1000-line file, the agent pays for 1000 lines of tokens just to answer *"what methods exist here?"* — and reading is only one of several questions an agent has. *"Who imports this?"* *"What's the public API?"* *"Are there cycles?"* *"Where in the repo is the login flow?"* — each one historically required dozens of file reads or noisy `grep`s.
+Modern coding agents explore codebases by reading files directly. On a 1000-line file, an agent consumes 1000 lines of tokens to answer *"what methods exist here?"* Questions about imports, public APIs, cycles, and feature locations can require dozens of file reads or noisy `grep` results.
 
 [ast-bro](https://github.com/aeroxy/ast-bro) collapses each of those questions into a single command:
 
-1. **Shape over bytes.** `map` / `digest` / `show` give you signatures and line ranges instead of method bodies — typically a **95% token saving** vs reading the file. `implements` finds subclasses with AST accuracy, no `grep` false positives.
-2. **Published API in one call.** `surface` resolves `pub use` re-exports (Rust), `__all__` (Python), barrel files (TypeScript), `export` clauses (Scala) so you see the surface a downstream user actually sees — not the union of every public item per file.
-3. **Dependency graph for free.** `deps` / `reverse-deps` / `cycles` / `graph` build a file-level import graph (Rust, Python, TS/JS, Java, C#, Kotlin, Scala, Go) cached at `.ast-bro/graph/`. Use `reverse-deps` before refactoring to know the blast radius. `cycles` exits non-zero — wire it into a CI gate. `graph` emits the full dependency graph (text by default, `--json` for JSON).
-4. **Symbol-level call graph.** `callers` / `callees` answer "who calls X" and "what does X call" with AST accuracy across all 14 languages — no `grep` false positives on overloaded names, comments, or string literals. Both are kind-aware: ask for a function and you get call-sites; ask for a type and you get implementors / constructions / ancestors. A three-pass resolver (same-file → global symbol table → dep-graph disambiguation) tags every edge `Exact` / `Inferred` / `Ambiguous` so you can filter by precision. `trace <FROM> <TO>` walks the shortest static call path between two symbols, inlining each hop's body — "how does X reach Y?" answered in one call instead of chaining `callees`. Same on-disk cache as the dep graph.
-5. **Hybrid semantic search.** `search` runs BM25 + dense embeddings via [`potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M) (a static, no-inference model — ~64 MB, runs on CPU in microseconds). `find-related` returns chunks structurally similar to one you already have, with a dep-graph-aware boost when a graph cache exists.
-6. **Blast radius in one shot.** `impact <symbol>` combines callers, callees, file-level deps, file-level reverse-deps, transitive callers at `--depth N`, and test-file detection into one "what would break?" report — replaces a chain of four round-trips with a single call. Four `--mode` variants: `all` (default), `deps`, `dependents`, `tests`. `--tests` / `--exclude-tests` narrow the filter. Works for both callables and types.
+1. **Shape over bytes.** `map` / `digest` / `show` give you signatures and line ranges instead of method bodies, typically saving **95% of the tokens** required to read the file. `implements` finds subclasses without `grep` false positives.
+2. **Published API in one call.** `surface` resolves `pub use` re-exports (Rust), `__all__` (Python), barrel files (TypeScript), and `export` clauses (Scala), so you see the API available to downstream users.
+3. **Dependency graph for free.** `deps` / `reverse-deps` / `cycles` / `graph` build a file-level import graph for 13 languages: Rust, Python, TypeScript, JavaScript, Java, C#, Kotlin, Scala, Go, C++, PHP, Ruby, and Zig. The shared cache lives at `.ast-bro/deps/graph.bin`. Use `reverse-deps` before refactoring to find affected files. `cycles` exits non-zero for a CI gate, and `graph` emits text or JSON.
+4. **Symbol-level call graph.** `callers` / `callees` answer "who calls X" and "what does X call" across 13 source-code languages without matches from comments or string literals. SQL and Markdown are shape-only adapters and do not emit call edges. Both commands are kind-aware: functions return call sites, while types return implementors, constructions, or ancestors. A three-pass resolver (same-file -> global symbol table -> dep-graph disambiguation) tags every edge `Exact`, `Inferred`, or `Ambiguous`. `trace <FROM> <TO>` returns the shortest static call path between two symbols and includes each hop's body. The call graph uses the same on-disk cache as the dep graph.
+5. **Hybrid semantic search.** `search` runs BM25 + dense embeddings via [`potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M) (a static, no-inference model: ~64 MB, runs on CPU in microseconds). `find-related` returns structurally similar chunks and loads the dependency graph lazily for neighborhood-aware ranking.
+6. **Blast radius in one shot.** `impact <symbol>` combines callers, callees, file-level deps, reverse-deps, transitive callers at `--depth N`, and test detection. It replaces four round-trips with one call. Its modes are `all` (default), `deps`, `dependents`, and `tests`; `--tests` / `--exclude-tests` narrow the filter. It works for callables and types.
 7. **Token-budgeted context.** `context <symbol> --budget N` packs "everything an LLM needs to understand this symbol" into a caller-supplied token budget: target body first, then direct callees (bodies while budget permits, signatures otherwise), direct callers (signatures), transitive callees/callers at depth 2 (signatures only). For types: type body, implementors, methods, callers-of-methods. Flags `truncated` when budget ran short and `target_omitted` when even the target body didn't fit. Same data as four or five `show`/`callers`/`callees` calls, one round-trip, budget-bounded.
-8. **Squeeze logs, not just code.** `squeeze` compresses a repetitive log/text file into a smaller, reversible form (a legend plus short tags) so a noisy log costs far fewer tokens to hand to an agent — and falls back to the raw text when squeezing wouldn't help. This is for *logs/text*, not code (for code, `map` / `digest` / `show` are the token win).
-9. **Nineteen native MCP tools.** Every analysis command is also exposed as an MCP tool — `ast-bro install --target <agent> --mcp` wires it into Claude Code, Cursor, Gemini, Codex, OpenCode, or VS Code Copilot in one line.
+8. **Squeeze logs, not just code.** `squeeze` compresses repetitive logs and text into a reversible legend plus short tags. It returns the raw text when compression would not help. Use `map` / `digest` / `show` to reduce code instead.
+9. **Nineteen native MCP tools.** Every analysis command is also exposed as an MCP tool: `ast-bro install --target <agent> --mcp` wires it into Claude Code, Cursor, Gemini, Codex, OpenCode, or VS Code Copilot in one line.
 
 ### The workflow
 
@@ -55,16 +55,15 @@ Agent: ast-bro digest src/Combat          # ~100 lines, whole module's structure
 Agent: ast-bro implements IDamageable     # precise list, no grep noise
 Agent: ast-bro search "damage handling"   # hybrid BM25 + dense semantic, ranked
 Agent: ast-bro show Player.cs TakeDamage  # just the method body
-Agent: ast-bro reverse-deps Player.cs     # who imports this — blast radius before refactor
-Agent: ast-bro callers Player.TakeDamage  # AST-accurate call sites — no grep false positives
+Agent: ast-bro reverse-deps Player.cs     # who imports this: blast radius before refactor
+Agent: ast-bro callers Player.TakeDamage  # AST-accurate call sites: no grep false positives
 Agent: ast-bro callees Player.TakeDamage  # what TakeDamage itself calls
 Agent: ast-bro impact Player.TakeDamage   # callers + callees + file deps + tests, one call
 Agent: ast-bro context Player.TakeDamage --budget 2000  # everything an LLM needs, token-bounded
 Agent: ast-bro cycles src/                # find import cycles via Tarjan SCC
 ```
 
-Result: **same understanding, a fraction of the tokens, a fraction of the round-trips.**
-For "what does this package actually expose?" — historically the most expensive question, since the answer was "read every file" — `surface` resolves the re-export graph and gives you the answer directly, often replacing dozens of file reads with a single call. For "what would break if I change this method?" — `callers` gives you the AST-accurate set of call sites in one shot, instead of `grep`-ing a homonym across the repo.
+The agent gets the same structural information with fewer tokens and round-trips. `surface` can replace dozens of reads when determining a package's public API. `callers` returns call sites for a method without matching homonyms elsewhere in the repository.
 
 ---
 
@@ -85,15 +84,18 @@ For "what does this package actually expose?" — historically the most expensiv
 | PHP        | `.php` |
 | Ruby       | `.rb` |
 | SQL        | `.sql`, `.ddl`, `.dml` |
+| Zig        | `.zig` |
 | Markdown   | `.md`, `.markdown`, `.mdx`, `.mdown` |
 
-*More coming soon! Adding another language is a single new adapter file leveraging the massive `ast-grep` language ecosystem.*
+This table lists the 15 shape-command adapters. The dependency and call graphs cover the 13 source-code languages; SQL and Markdown do not emit graph edges. `run` accepts only languages provided by ast-grep, so Zig, SQL, and Markdown are unavailable for structural search and rewrite.
+
+Adding another `ast-grep` language starts with a new adapter file. Languages outside `ast-grep` also need native parser routing; see the [architecture guide](wiki/architecture.md#adding-a-new-language).
 
 For Markdown the "symbols" are headings and fenced code blocks, plus a leading
 YAML frontmatter block: `--- frontmatter` shows up in `map` and `digest` with
 its line range, and `frontmatter` is a `show` handle
 (`ast-bro show tasks/ frontmatter` collects every card's block in one call).
-Only a `---` fence on the file's first line counts — a `---` further down stays
+Only a `---` fence on the file's first line counts: a `---` further down stays
 an ordinary horizontal rule. Trailing whitespace on either fence and a leading
 UTF-8 BOM are tolerated; `...` closes a block as well as `---`. TOML
 frontmatter (`+++`) is not surfaced.
@@ -102,11 +104,11 @@ frontmatter (`+++`) is not surfaced.
 
 ## What gets walked
 
-[ast-bro](https://github.com/aeroxy/ast-bro) skips a lot of files when walking a directory — by design. Filters apply uniformly across every subcommand.
+[ast-bro](https://github.com/aeroxy/ast-bro) deliberately skips files when walking a directory. Filters apply uniformly across directory-walking subcommands.
 
-1. **`.gitignore` and friends** — every level's `.gitignore`, your global gitignore, `.git/info/exclude`, and `.ignore` files (the [`ignore`](https://crates.io/crates/ignore) crate's convention used by `ripgrep`/`fd`).
-2. **Hardcoded denylist** — directories almost no one wants walked, even if `.gitignore` doesn't list them: `.git`, `node_modules`, `target`, `dist`, `build`, `__pycache__`, `.venv`, `venv`, `.cache`, `.idea`, `.vscode`, `.next`, `.nuxt`, `.turbo`, `.parcel-cache`, `.gradle`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.eggs`, `.ast-bro`, and a few others.
-3. **`.ast-bro-ignore`** — per-repo escape hatch. Same syntax as `.gitignore`. Useful for excluding paths from [ast-bro](https://github.com/aeroxy/ast-bro) that you *don't* want excluded from git itself, e.g. test fixtures or vendored corpora:
+1. **`.gitignore` and friends**: every level's `.gitignore`, your global gitignore, `.git/info/exclude`, and `.ignore` files (the [`ignore`](https://crates.io/crates/ignore) crate's convention used by `ripgrep`/`fd`).
+2. **Hardcoded denylist**: directories almost no one wants walked, even if `.gitignore` doesn't list them: `.git`, `node_modules`, `target`, `dist`, `build`, `__pycache__`, `.venv`, `venv`, `.cache`, `.idea`, `.vscode`, `.next`, `.nuxt`, `.turbo`, `.parcel-cache`, `.gradle`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.eggs`, `.ast-bro`, and a few others.
+3. **`.ast-bro-ignore`**: per-repo escape hatch. Same syntax as `.gitignore`. Useful for excluding paths from [ast-bro](https://github.com/aeroxy/ast-bro) that you *don't* want excluded from git itself, e.g. test fixtures or vendored corpora:
 
    ```gitignore
    # .ast-bro-ignore
@@ -114,9 +116,9 @@ frontmatter (`+++`) is not surfaced.
    benches/data/
    *.generated.rs
    ```
-4. **Extension allowlist** — files are only opened if their extension is one ast-bro knows how to parse (the table above for map/digest/show/implements; a broader set for the search commands). Explicitly-passed extensionless files fall back to shebang detection (`#!/usr/bin/env python3` → Python, `#!/usr/bin/ruby` → Ruby, `#!/usr/bin/env node` → TypeScript, etc.) — so CLI scripts like `~/.local/bin/my-script` or `bin/deploy` work without an extension. Directory walks do **not** open extensionless files; the shebang is only consulted for explicit inputs to keep the walk fast.
+4. **Extension allowlist**: files are only opened if ast-bro knows their extension (the table above for map/digest/show/implements; a broader set for search). Explicitly passed extensionless files fall back to shebang detection (`#!/usr/bin/env python3` -> Python, `#!/usr/bin/ruby` -> Ruby, `#!/usr/bin/env node` -> TypeScript, etc.). Directory walks do **not** open extensionless files; only explicit inputs use shebang detection.
 
-Want to see exactly what ast-bro walks? Compare `ast-bro digest some/dir` with `rg --files some/dir` — anything in `rg` but not the digest is being filtered by one of the layers above.
+Compare `ast-bro digest some/dir` with `rg --files some/dir` to inspect the walk. A path that appears only in `rg` was removed by one of the filters above.
 
 ---
 
@@ -146,7 +148,7 @@ pip install ast-bro
 cargo install ast-bro
 ```
 
-This installs the [ast-bro](https://github.com/aeroxy/ast-bro) CLI globally into `~/.cargo/bin` — make sure that's on your `PATH`.
+This installs the [ast-bro](https://github.com/aeroxy/ast-bro) CLI globally into `~/.cargo/bin`, so make sure that directory is on your `PATH`.
 
 ### Nix
 
@@ -213,7 +215,7 @@ ast-bro cycles                      # find import cycles via Tarjan SCC
 ast-bro graph .                     # full dependency graph (text)
 ast-bro graph . --json              # same, as JSON (ast-bro.graph.v1)
 
-# Call graph: who calls X, what does X call (AST-accurate, all 14 langs)
+# Call graph: who calls X, what does X call (13 source-code languages)
 ast-bro callers TakeDamage              # function/method: in-edges
 ast-bro callers --tests TakeDamage      # same, only test files
 ast-bro callers --hide-ambiguous TakeDamage  # drop ambiguous call edges
@@ -319,34 +321,26 @@ whole file to the model. Registering a `PostToolUse` entry by hand does
 nothing useful for `Read` on that version, for the same reason. See
 [issue #34](https://github.com/aeroxy/ast-bro/issues/34).
 
-On Claude Code the hook also registers under `PostToolUseFailure`, for
-the read the host refuses outright — measured against its file-size
-limit, 256 KB on Claude Code 2.1.223. That limit counts bytes, not lines,
-so it catches files no `--min-lines` threshold does: a 90-line file of
-355 KB trips it. Without this the agent gets a bare error and nothing
-else. That event cannot replace a result, only add context, which is all
-the map needs when the result carries no file contents. Nothing is
-blocked on that path: the host already failed the call, so the map
-arrives beside the error rather than in place of anything.
+On Claude Code the hook also registers under `PostToolUseFailure` for reads
+that exceed the host's file-size limit, which is 256 KB in Claude Code
+2.1.223. That byte limit catches files no `--min-lines` threshold does; a
+90-line, 355 KB file trips it. Without this hook, the agent gets an error and
+no map. `PostToolUseFailure` cannot replace a result, but it can add the map as
+context beside the host's error.
 
-Whatever the channel, the map is capped at 64 KB. A map that would run
-over can shed detail — doc comments and attributes first, then fields and
-private items, with a per-type member cap as a last backstop that rarely
-comes up — or keep the detail and drop whole entries instead. Which one
-you get is decided by how many declarations each delivers, not by which
-fits first: a mostly-private file would fit the moment private items
-went, and hand you the public few, so it is trimmed at a richer level
-instead.
+Whatever the channel, the map is capped at 64 KB. To fit that cap, the hook
+compares two options. It can remove doc comments and attributes, then fields
+and private items, and finally cap members per type. It can instead preserve
+detail and drop whole declarations. The hook chooses the option that returns
+more declarations. This avoids reducing a mostly private file to only its few
+public declarations when a richer partial map fits.
 
-A trim spends the 64 KB in the order that ladder ranks: whatever survives
-furthest down it goes in first, so a file's public surface is what the
-budget buys before anything else — all of it, unless the public surface
-alone is over the cap. Filling in file order instead handed back 1733
-private items and none of that file's 500 public ones, because the
-publics ran to the end of a file twice the budget. What a
-trim drops, it drops entire — a declaration leaves with its doc comment
-and its members, rather than leaving them to read as someone else's. The
-payload then ends with a note saying what is missing and the
+The trim orders declarations by the same detail ladder, so it includes the
+public surface first unless that surface alone exceeds 64 KB. Filling in file
+order once returned 1,733 private items and none of the file's 500 public
+items because the public items were at the end. A trim removes each
+declaration with its doc comment and members, which prevents orphaned details.
+The payload ends with a note that identifies missing content and gives the
 `ast-bro map` command that returns it.
 
 ### Claude Code subagent shadowing
@@ -357,11 +351,12 @@ automatically shadows these subagents with `.claude/agents/<Name>.md` files
 containing the full ast-bro prompt.
 
 When you run `ast-bro install --target claude-code`, you get:
-- `CLAUDE.md` — main agent prompt (global or local per-repo)
-- `.claude/settings.json` — `Read` hooks on `PreToolUse` and `PostToolUseFailure`
-- `.claude/agents/Explore.md` — Explore subagent with the prompt injected
 
-This solves the "why doesn't my subagent use ast-bro?" problem — subagents
+- `CLAUDE.md`: main agent prompt (global or local per-repo)
+- `.claude/settings.json`: `Read` hooks on `PreToolUse` and `PostToolUseFailure`
+- `.claude/agents/Explore.md`: Explore subagent with the prompt injected
+
+This solves the "why doesn't my subagent use ast-bro?" problem: subagents
 now get the prompt automatically. Legacy manual `~/.claude/agents/Explore.md` files
 are wrapped in marker blocks in-place (non-breaking).
 
@@ -381,7 +376,7 @@ cp -r skills/ast-bro ~/.claude/skills/ast-bro
 /ast-bro
 ```
 
-This works alongside `ast-bro install` — the skill definition tells Claude Code
+This works alongside `ast-bro install`: the skill definition tells Claude Code
 how to invoke the [ast-bro](https://github.com/aeroxy/ast-bro) CLI with proper tool schemas and documentation.
 
 Manual install via `ast-bro prompt` (e.g. project-level):
@@ -421,14 +416,14 @@ pub struct Declaration  L10-120
     pub fn lines_suffix(&self) -> String  L30-48
 ```
 
-### `show` across a file, a directory, or a glob
+### Multi-file `show`
 
 A `show` target is a file, a directory, or a quoted glob, so you can extract a
 symbol you can name from a tree you haven't mapped yet:
 
 ```bash
 ast-bro show src/ TakeDamage            # searches every parseable file
-ast-bro show 'src/**/*.cs' TakeDamage   # quote it — see below
+ast-bro show 'src/**/*.cs' TakeDamage   # quote it: see below
 ast-bro show a.java b.java greet        # an explicit list works too
 ```
 
@@ -453,7 +448,7 @@ nested inside, without a second `map` call:
 
 ```
 # Player.cs:30-48  Game.Player.PlayerController.TakeDamage  (method)
-# in: namespace Game.Player → public class PlayerController : MonoBehaviour, IDamageable
+# in: namespace Game.Player -> public class PlayerController : MonoBehaviour, IDamageable
 /// <summary>Apply damage.</summary>
 public void TakeDamage(int amount) { ... }
 ```
@@ -463,7 +458,7 @@ public void TakeDamage(int amount) { ... }
 ## JSON output
 
 Add `--json` to any command to get the full symbol graph as stable,
-structured JSON instead of formatted text — ideal for editors, language
+structured JSON instead of formatted text for editors, language
 servers, CI tooling, or any script that needs to consume the data
 programmatically.
 
@@ -525,14 +520,13 @@ changes, so downstream tooling can guard on it:
 | `ast-bro.squeeze.v1` | `squeeze --json` |
 | `ast-bro.error.v1` | any rejected call under `--json` (on stderr) |
 
-`show` is the one schema past v1. **v1 → v2:** the top-level `path` /
+`show` is the one schema past v1. **v1 -> v2:** the top-level `path` /
 `language` / `matches` keys moved into a `files` array (one entry per file,
 same three keys), because a target can now be several files rather than only
-one. Alongside it, v2 adds the counters the text coverage header carries —
-`files_scanned`, `files_matched`, `total`, `shown`, `truncated` — plus
-`unmatched`, an array of the requested symbols that matched nothing. That one
-is not a counter and is not in the text header: on the CLI it surfaces as a
-stderr note. A v1 consumer reading one explicit file migrates by taking
+one. Version 2 also adds the text coverage counters `files_scanned`,
+`files_matched`, `total`, `shown`, and `truncated`. The `unmatched` array lists
+requested symbols that matched nothing; the CLI reports those names as a
+stderr note instead of a text-header counter. A v1 consumer reading one explicit file migrates by taking
 `files[0]`.
 
 ---
@@ -541,14 +535,14 @@ stderr note. A v1 consumer reading one explicit file migrates by taking
 
 One rule set for every subcommand, so a consumer never needs a per-command table:
 
-- **Channel** — stdout carries results only; every note, hint, and error goes to stderr. `--json` output always parses without preprocessing.
-- **Exit codes** — `0`: the query ran; the answer may be legitimately empty ("this symbol genuinely has no callers"), and any qualification — a path that didn't resolve, a display cap, a depth cutoff — is reported as a `# note:` on stderr, so read the notes before treating exit-0 output as exhaustive. `2`: the query could not run as asked — no such path, no such symbol, unknown flag, missing argument, or an empty argument list (e.g. a `$(...)` substitution that produced nothing). `1`: internal failure. Two deliberate additions: `cycles` exits `3` when cycles exist, and `run` exits `1` when a valid pattern matched nothing, following the `grep` / `ripgrep` convention — a `run` that was *rejected* still exits 2 with empty stdout.
-- **Machine-readable rejections** — with `--json`, a rejected call also emits an `ast-bro.error.v1` object on stderr: `{schema, command, kind, detail, hint}` with `kind` ∈ `no_input | path_not_found | symbol_not_found | unknown_flag | bad_argument | index_error`.
+- **Channel**: stdout carries results only; every note, hint, and error goes to stderr. `--json` output always parses without preprocessing.
+- **Exit codes**: `0` means the query ran, even if the answer is empty. Qualifications such as unresolved paths, display caps, and depth cutoffs appear as `# note:` messages on stderr. `2` means the query could not run as asked. `1` means an internal failure. Two commands add result-specific codes: `cycles` exits `3` when cycles exist, while `run` exits `1` when a valid pattern matched nothing. A rejected `run` still exits `2` with empty stdout.
+- **Machine-readable rejections**: with `--json`, a rejected call also emits an `ast-bro.error.v1` object on stderr: `{schema, command, kind, detail, hint}`. `kind` is one of `no_input | path_not_found | symbol_not_found | unknown_flag | bad_argument | index_error`.
 - **Unknown flags** exit 2 with the error on stderr; when the flag exists on a sibling subcommand, the message names it (`--glob is a map flag`).
-- **Truncation is never silent** — when `--limit` / `--max-members` cut a list, the header reports the true total and the flag that lifts the cap, and JSON carries `total` / `truncated`. `--limit` bounds the *display*, not the work: `callers` / `impact` / `reverse-deps` walk the full reverse cone so the reported total is exact, which at `--depth 5` on a large repository is real work regardless of the cap.
-- **A depth cutoff says so too** — a walk that ran out of `--depth` and one that ran out of graph both just stop, so every depth-bounded command reports which happened: `frontier_truncated` in JSON (`callers`, `callees`, `deps`, `reverse-deps`, `trace`, and each `impact` report), plus a stderr note in text mode. It is orthogonal to `truncated`: `truncated: false` with `frontier_truncated: true` means nothing was cut from the display and `total` itself counts only the cone inside `--depth`. On `trace`, it separates "no path" from "no path within `--depth`".
+- **Truncation is never silent**: when `--limit` / `--max-members` cut a list, the header reports the true total and the flag that lifts the cap, and JSON carries `total` / `truncated`. `--limit` bounds the *display*, not the work: `callers` / `impact` / `reverse-deps` walk the full reverse cone so the reported total is exact, which at `--depth 5` on a large repository is real work regardless of the cap.
+- **Depth cutoffs**: a walk that ran out of `--depth` and one that ran out of graph both just stop, so every depth-bounded command reports which happened: `frontier_truncated` in JSON (`callers`, `callees`, `deps`, `reverse-deps`, `trace`, and each `impact` report), plus a stderr note in text mode. It is orthogonal to `truncated`: `truncated: false` with `frontier_truncated: true` means nothing was cut from the display and `total` itself counts only the cone inside `--depth`. On `trace`, it separates "no path" from "no path within `--depth`".
 
-`map` and `digest` are one command: `digest` is an alias for `map --preset digest` (= `--detail names --no-private --no-fields --max-members 50`), and both accept the full flag set — detail (`--detail names|signatures|full`), visibility (`--no-private`, `--no-fields`, `--no-docs`, `--include-private`, `--include-fields`, …), and scope (`--glob`, `--max-members`) are independent axes. Explicit flags override the preset. At `names`/`signatures` detail the JSON payload sheds doc comments, which are routinely a third of its weight — including under `digest`, where the preset opts in on the caller's behalf. Any payload with keys removed carries a `projected` object (`{docs, line_numbers, attributes}`) so a consumer can guard on it instead of inferring the absence; an unprojected payload has no such key and is byte-identical to before.
+`map` and `digest` are one command. `digest` is an alias for `map --preset digest` (= `--detail names --no-private --no-fields --max-members 50`), and both accept the full flag set. Detail (`--detail names|signatures|full`), visibility (`--no-private`, `--no-fields`, `--no-docs`, `--include-private`, `--include-fields`, ...), and scope (`--glob`, `--max-members`) are independent controls. Explicit flags override the preset. At `names` and `signatures` detail, JSON omits doc comments, including under `digest`. A projected payload carries `{docs, line_numbers, attributes}` in a `projected` object so consumers can distinguish intentional omission. An unprojected payload has no such key and remains byte-identical to the previous form.
 
 ---
 
@@ -556,7 +550,7 @@ One rule set for every subcommand, so a consumer never needs a per-command table
 
 Run [ast-bro](https://github.com/aeroxy/ast-bro) as a [Model Context Protocol](https://modelcontextprotocol.io)
 server over stdio so any MCP-aware coding agent can call the same operations
-as native tools — no shell parsing required:
+as native tools without shell parsing:
 
 ```bash
 ast-bro mcp
@@ -598,7 +592,7 @@ Wire it into a client by pointing at the binary:
 ```
 
 The server is fully synchronous, has no extra runtime dependencies, and adds
-roughly 1% to the binary size. The CLI itself is unaffected — none of the MCP
+roughly 1% to the binary size. The CLI itself is unaffected: none of the MCP
 code runs unless you invoke the `mcp` subcommand.
 
 ---
@@ -608,11 +602,11 @@ code runs unless you invoke the `mcp` subcommand.
 `ast-bro search` runs hybrid retrieval over a per-repo index:
 
 - **BM25** for exact identifier matches and keyword density.
-- **Dense embeddings** via [`minishlab/potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M) — a static (no inference) `vocab × 256` model that runs on CPU in microseconds.
-- **Reciprocal Rank Fusion** (k = 60) blends the two; alpha auto-resolves to 0.3 for symbol queries (`HandlerStack`, `Sinatra::Base` — lean BM25) and 0.5 for natural language ("how does login work" — balanced).
+- **Dense embeddings** use [`minishlab/potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M), a static `vocab x 256` model with no inference step.
+- **Reciprocal Rank Fusion** (k = 60) blends the two. Alpha resolves to 0.3 for symbol queries such as `HandlerStack` and `Sinatra::Base`, or 0.5 for natural-language queries.
 - A ranking pass adds definition boosts (3× for chunks that *define* a queried symbol), file-coherence boosts (multi-chunk hits in the same file lift the top chunk), file-stem matches for NL queries, and path-based penalties (test files 0.3×, `.d.ts` stubs 0.7×, `__init__.py` 0.5×).
 
-`ast-bro find-related <file>:<line>` is the same engine in semantic-only mode, language-filtered, with the source chunk excluded — useful for "what else is structured like this?"
+`ast-bro find-related <file>:<line>` uses the same engine in semantic-only mode, filters by language, and excludes the source chunk. Use it to find code with a similar structure.
 
 ```bash
 ast-bro search "request validation" -k 5
@@ -636,13 +630,13 @@ First call to `search` / `find-related` builds an index at `.ast-bro/index/`:
     lock               # advisory lock for concurrent writers
 ```
 
-Subsequent calls walk the tree, compare `(mtime, size)` against `files.bin`, and only hash files where the cheap check fails. If anything changed, the index rebuilds automatically (a v2 will support partial updates against the same on-disk format). Steady-state cost on an unchanged 10k-file repo: ~30 ms of stat syscalls.
+Subsequent calls walk the tree, compare `(mtime, size)` against `files.bin`, and hash only files where the cheap check fails. A file delta tombstones replaced chunks and appends updated chunks. The index rebuilds fully only when the delta update fails or tombstones cross the compaction threshold. Steady-state cost on an unchanged 10k-file repo is about 30 ms of stat syscalls.
 
 The model is downloaded once (~64 MB) on first use to `~/.cache/ast-bro/models/`. It tries HuggingFace first, falls back to `hf-mirror.com` if blocked. **TLS verification is disabled by default** so corporate MITM proxies don't break setup; integrity is enforced via SHA-256 on every cached file. Set `AST_OUTLINE_TLS_STRICT=1` to enforce strict TLS.
 
 For more on what gets indexed (the five filter layers, `.ast-bro-ignore` syntax) see the "What gets walked" section above. For the security trade-offs around the TLS default, see the [network-security wiki page](https://github.com/aeroxy/ast-bro/blob/main/wiki/network-security.md) on GitHub.
 
-`find-related` quietly benefits from the dep graph too — when one is cached, results are reranked so files within depth 2 of the source (importer or importee) get a multiplicative boost. Disable with `--no-dep-boost`.
+`find-related` loads or builds the dep graph on its first boosted query. It boosts results within dependency depth 2 of the source, in either direction. Disable this with `--no-dep-boost`.
 
 ---
 
@@ -658,15 +652,19 @@ ast-bro graph .                              # full dependency graph (text)
 ast-bro graph . --json                      # same, as JSON (ast-bro.graph.v1)
 ```
 
-All four commands share one cache at `.ast-bro/graph/index.bin` (a unified `UnifiedGraph { deps, calls: Option<CallGraph> }` — same file used by `callers` / `callees`, see below). First call builds the dep half (~hundreds of ms for typical repos via the same `ignore`-respecting walk used by search); subsequent calls reuse it via per-file delta detection, with `--rebuild` to force a fresh build. Inside `ast-bro mcp`, every `tools/call` shares one in-memory `Arc<UnifiedGraph>` so the second invocation in a session is a memory read, not a disk read.
+All four commands share `.ast-bro/deps/graph.bin`, which stores `UnifiedGraph { deps, calls: Option<CallGraph> }` for both dependency and call queries. The first call builds the dependency half; later calls use per-file delta detection, and `--rebuild` forces a fresh build. Inside `ast-bro mcp`, a registry entry for each canonical repository root is revalidated on every call. An unchanged tree reuses its in-memory `Arc<UnifiedGraph>` without another disk read; an edit patches the graph and swaps in a new `Arc`.
 
 Resolution is per-language but shares one suffix-index resolver:
 
 - **Rust**: `use crate::*` / `use super::*` / `mod foo;` (with `#[path]` attribute support).
 - **Python**: relative imports (`from .x import y`), `__init__.py` packages, bare `import a.b`.
-- **TypeScript / JavaScript**: relative paths with extension probing (`.ts → .tsx → .mts → .cts → .d.ts → .js → ... → .json`), `index.*` fallback, `tsconfig.json` `paths` aliases.
+- **TypeScript / JavaScript**: relative paths with extension probing (`.ts -> .tsx -> .mts -> .cts -> .d.ts -> .js -> ... -> .json`), `index.*` fallback, `tsconfig.json` `paths` aliases.
 - **Java / Kotlin / Scala / C#**: FQN suffix index built from each file's `package` / `namespace` declaration. Inner classes resolve via strip-and-retry.
-- **Go**: `go.mod` `module` prefix is stripped; `import "mymod/pkg/foo"` resolves to `pkg/foo/*.go` (directory-as-package). Every `go.mod` in the repository counts, so a module in a subdirectory — or several modules side by side — resolves the same way.
+- **Go**: strips the `go.mod` module prefix and resolves packages by directory. Every `go.mod` in the repository counts, including modules in subdirectories and side-by-side modules.
+- **C++**: resolves quoted `#include` paths relative to the importer and leaves system headers external.
+- **PHP**: resolves namespace imports through Composer PSR-4 mappings, suffix lookup, and a class-name fallback. Literal `include` / `require` paths resolve relative to the importer.
+- **Ruby**: resolves literal `require_relative` calls and leaves `$LOAD_PATH` or gem imports external.
+- **Zig**: resolves literal `.zig` paths in `@import` relative to the importer. Named modules such as `std` stay external because resolving them requires evaluating `build.zig`.
 
 The four commands are also exposed as MCP tools for agents. For internals (suffix index, Tarjan SCC, per-file invalidation, find-related dep boost) see the [deps wiki page](https://github.com/aeroxy/ast-bro/blob/main/wiki/deps.md) on GitHub.
 
@@ -674,7 +672,7 @@ The four commands are also exposed as MCP tools for agents. For internals (suffi
 
 ## Call graph
 
-`ast-bro callers` and `ast-bro callees` answer "who calls X" and "what does X call" with AST accuracy across all 14 languages. They replace `grep` for refactor blast-radius assessment — no false positives on overloaded names, comments, or string literals.
+`ast-bro callers` and `ast-bro callees` answer "who calls X" and "what does X call" across 13 source-code languages. SQL and Markdown do not enter the call graph because their adapters intentionally emit no call sites. The commands avoid `grep` matches from comments and string literals.
 
 ```bash
 ast-bro callers TakeDamage              # function/method: in-edges
@@ -695,19 +693,19 @@ Symbol forms accepted by both: bare suffix (`TakeDamage`), dotted (`Player.TakeD
 
 **Three-pass resolver.** Bare names are disambiguated in three increasing-cost passes:
 
-1. **Same-file** — local definitions + per-file `import` / `use` / `using` bindings.
-2. **Global symbol table** — single-match promotion across the project. Receiver-bearing calls (`obj.bar()`) skip this pass to avoid `builder.hidden()`-style false positives on global homonyms.
-3. **Dep-graph disambiguation** — for ambiguous matches, filter candidates by the caller's transitive forward-dep closure.
+1. **Same-file**: local definitions + per-file `import` / `use` / `using` bindings.
+2. **Global symbol table**: single-match promotion across the project. Receiver-bearing calls (`obj.bar()`) skip this pass to avoid `builder.hidden()`-style false positives on global homonyms.
+3. **Dep-graph disambiguation**: for ambiguous matches, filter candidates by the caller's transitive forward-dep closure.
 
-Every edge carries a `Confidence` tag — `Exact` (passes A/B), `Inferred` (pass C narrowed to one), or `Ambiguous` (multiple candidates survive). Ambiguous callers and unresolved/external callees are shown by default (tagged); `--hide-ambiguous` (callers) and `--hide-external` (callees) drop them when you want the cleaner bucket.
+Every edge carries a `Confidence` tag: `Exact` (passes A/B), `Inferred` (pass C narrowed to one), or `Ambiguous` (multiple candidates survive). Ambiguous callers and unresolved/external callees are shown by default (tagged); `--hide-ambiguous` (callers) and `--hide-external` (callees) drop them when you want the cleaner bucket.
 
-**Cache.** Same `.ast-bro/graph/index.bin` as the dep graph, lazily promoted — users who only run `deps` / `cycles` never pay the call-graph build cost. Per-file invalidation: edit one file, only that file gets re-extracted and re-resolved.
+**Cache.** The call graph uses the same `.ast-bro/deps/graph.bin` as the dep graph and builds lazily, so `deps` / `cycles` users do not pay the call-extraction cost. Per-file invalidation normally re-extracts only edited files. After a Zig edit, it also refreshes unchanged Zig callers with receiver-bearing edges so namespace imports match a cold build.
 
 For internals (per-language node-kind tables, the call-shape pitfalls each adapter handles, the per-file patch path, cost numbers) see the [calls wiki page](https://github.com/aeroxy/ast-bro/blob/main/wiki/calls.md) on GitHub.
 
 ---
 
-## Architecture & Development
+## Architecture and development
 
 See the [wiki](https://github.com/aeroxy/ast-bro/blob/main/wiki/architecture.md) on GitHub for details on how [ast-bro](https://github.com/aeroxy/ast-bro) leverages `ast-grep` internally and how you can add new language adapters.
 

@@ -34,7 +34,7 @@ pub const HARDCODED_IGNORE_DIRS: &[&str] = &[
     // JS/TS
     "node_modules", ".next", ".nuxt", ".turbo", ".parcel-cache",
     // Build outputs
-    "dist", "build", "out", ".eggs", "target",
+    "dist", "build", "out", ".eggs", "target", "zig-out", ".zig-cache", "zig-cache",
     // Other
     ".cache", ".gradle", ".idea", ".vscode",
     // Self (keep legacy name during transition)
@@ -373,6 +373,17 @@ mod tests {
     fn skip_target_dir() {
         let root = PathBuf::from("/r");
         assert!(should_skip_path(&root.join("target/debug/build/x.rs"), &root));
+    }
+
+    #[test]
+    fn skip_zig_build_directories() {
+        let root = PathBuf::from("/r");
+        for directory in ["zig-out", ".zig-cache", "zig-cache"] {
+            assert!(
+                should_skip_path(&root.join(directory).join("generated.zig"), &root),
+                "{directory} should be ignored"
+            );
+        }
     }
 
     #[test]

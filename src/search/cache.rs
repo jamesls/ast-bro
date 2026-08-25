@@ -274,6 +274,29 @@ mod tests {
     }
 
     #[test]
+    fn delta_detects_modified_zig_file() {
+        let dir = tmp_repo();
+        let path = touch(dir.path(), "src/main.zig", "pub fn main() void {}\n");
+        let meta = fs::metadata(&path).unwrap();
+        let record = FileRecord {
+            path: "src/main.zig".to_string(),
+            mtime_ns: mtime_nanos(&meta),
+            size: meta.len(),
+            content_hash: hash_file(&path).unwrap(),
+            chunk_start: 0,
+            chunk_end: 1,
+        };
+        fs::write(&path, "pub fn main() void { helper(); }\n").unwrap();
+
+        let delta = compute_delta(dir.path(), dir.path(), &[record]);
+
+        assert_eq!(delta.seen_count, 1);
+        assert_eq!(delta.modified, vec![path]);
+        assert!(delta.added.is_empty());
+        assert!(delta.removed.is_empty());
+    }
+
+    #[test]
     fn delta_mtime_only_when_hash_unchanged() {
         let dir = tmp_repo();
         let path = touch(dir.path(), "f.rs", "fn x() {}");

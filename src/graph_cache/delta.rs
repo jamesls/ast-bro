@@ -7,10 +7,11 @@
 //!
 //! Stale-edge handling (calls half): edges originating from *unchanged*
 //! files that point to a qn defined in a *changed* file are validated after
-//! the re-extract (step 8) and demoted when their target no longer exists,
-//! then re-resolved by name (step 9).
+//! the re-extract and demoted when their target no longer exists. Unchanged
+//! Zig callers that may use namespace imports run through the complete
+//! resolver again; remaining bare edges are then re-resolved by name.
 //!
-//! The invariant step 9 has to hold is **parity**: a partial update and a
+//! The repair path has to preserve **parity**: a partial update and a
 //! cold build of the same content must produce the same graph, or an
 //! unrelated edit silently changes answers elsewhere in the project. That
 //! means reusing the cold build's own rules — `resolve::disambiguate` for
@@ -183,6 +184,10 @@ pub fn apply_delta_to_calls(
         .par_iter()
         .filter_map(|file| extract_file(root, file))
         .collect();
+    let mut fully_resolved_files: HashSet<String> = new_passes
+        .iter()
+        .map(|pass| file_rel(root, &pass.file))
+        .collect();
 
     // 6. Splice new qns into the live indices before resolving — so when
     //    pass A/B looks up the global symbol_table for a new edge, the
@@ -234,7 +239,8 @@ pub fn apply_delta_to_calls(
         calls.callable_meta.keys().cloned().collect();
     for edges in calls.forward.values_mut() {
         for e in edges.iter_mut() {
-            let demote = matches!(&e.target, CallTarget::Resolved(qn) if !known_callable.contains(qn));
+            let demote =
+                matches!(&e.target, CallTarget::Resolved(qn) if !known_callable.contains(qn));
             if demote {
                 let bare = e.target.name_or_raw();
                 e.target = CallTarget::Bare(bare);
@@ -244,7 +250,57 @@ pub fn apply_delta_to_calls(
         }
     }
 
-    // 9. Bare-name re-resolution: the same rules the cold build applies, so
+    // 9. Re-run the complete resolver for unchanged Zig files with receiver
+    //    calls after a Zig delta. Namespace-import pass A depends on the
+    //    caller's ImportBindings, which are not stored in CallGraph; the
+    //    generic bare-name repair below cannot reconstruct that information.
+    //    Re-extracting this narrow set preserves cold/incremental parity when
+    //    an imported callable appears, disappears, or changes shape.
+    let zig_changed = changed.iter().any(|path| {
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zig"))
+    });
+    if zig_changed {
+        let zig_files: HashSet<String> = calls
+            .forward
+            .iter()
+            .filter(|(source, edges)| {
+                !changed.contains(source.file())
+                    && Path::new(source.file())
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("zig"))
+                    && edges.iter().any(|edge| edge.receiver.is_some())
+            })
+            .map(|(source, _)| source.file().to_string())
+            .collect();
+        if !zig_files.is_empty() {
+            let passes: Vec<FilePass> = zig_files
+                .iter()
+                .filter_map(|relative| {
+                    let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    extract_file(root, &path)
+                })
+                .collect();
+            let refreshed_files: HashSet<String> = passes
+                .iter()
+                .map(|pass| file_rel(root, &pass.file))
+                .collect();
+            fully_resolved_files.extend(refreshed_files.iter().cloned());
+            calls
+                .forward
+                .retain(|source, _| !refreshed_files.contains(source.file()));
+            let table = calls.symbol_table.clone();
+            let refreshed = resolve::run_with_table(root, deps, passes, table);
+            for (source, edges) in refreshed.forward {
+                calls.forward.insert(source, edges);
+            }
+        }
+    }
+
+    // 10. Bare-name re-resolution: the same rules the cold build applies, so
     //    a partial update and a cold build of the same content agree.
     //    Pass B's rule — a single global match promotes, receiver-bearing
     //    calls don't (without a type for `obj`, single-name matches are too
@@ -255,16 +311,29 @@ pub fn apply_delta_to_calls(
     //    the project candidates the dep filter had ruled out, so one
     //    unrelated file edit changed answers everywhere.
     let mut closures = crate::calls::resolve::ClosureCache::default();
-    for edges in calls.forward.values_mut() {
+    for (source, edges) in &mut calls.forward {
+        // New and explicitly refreshed files have already run through all
+        // three cold-build passes with their ImportBindings available.
+        // Repairing their deliberate Bare results again would let the
+        // generic pass-C path override a rejected namespace import.
+        if fully_resolved_files.contains(source.file()) {
+            continue;
+        }
         for e in edges.iter_mut() {
-            let CallTarget::Bare(name) = &e.target else { continue };
-            let Some(cands) = calls.symbol_table.get(name) else { continue };
+            let CallTarget::Bare(name) = &e.target else {
+                continue;
+            };
+            let Some(cands) = calls.symbol_table.get(name) else {
+                continue;
+            };
             // Same gate as pass B on a cold build: scope-shifting keyword
             // receivers (`crate`/`super`) withhold single-match promotion —
             // the one match may sit in a scope the keyword rules out.
             let recv = e.receiver.as_deref();
-            let has_receiver = !crate::calls::resolve::receiver_is_self_like(recv)
-                || crate::calls::resolve::receiver_is_scope_shifting(recv);
+            let lang = crate::deps::resolver::Lang::from_path(Path::new(source.file()));
+            let has_receiver = !crate::calls::resolve::receiver_is_self_like_for_lang(recv, lang)
+                || (lang != Some(crate::deps::resolver::Lang::Zig)
+                    && crate::calls::resolve::receiver_is_scope_shifting(recv));
             if cands.len() == 1 && !has_receiver {
                 // Same tag pass B gives this case on a cold build
                 // (`resolve.rs`, single global match, no receiver) — parity
@@ -293,7 +362,7 @@ pub fn apply_delta_to_calls(
         }
     }
 
-    // 10. Reverse adjacency + stats are derived; rebuild fresh.
+    // 11. Reverse adjacency + stats are derived; rebuild fresh.
     calls.rebuild_reverse();
     recompute_call_stats(calls);
 }

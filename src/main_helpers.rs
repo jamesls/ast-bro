@@ -29,7 +29,7 @@ pub fn can_parse_for_hook(path: &Path) -> bool {
         .to_ascii_lowercase();
     if matches!(
         ext.as_str(),
-        "sql" | "ddl" | "dml" | "md" | "markdown" | "mdx" | "mdown"
+        "sql" | "ddl" | "dml" | "md" | "markdown" | "mdx" | "mdown" | "zig"
     ) {
         return true;
     }
@@ -85,6 +85,12 @@ pub fn parse_file_for_hook(path: &Path) -> Option<ParseResult> {
 
     if matches!(ext, "md" | "markdown" | "mdx" | "mdown") {
         let mut r = crate::adapters::markdown::parse_markdown(path, source.as_bytes());
+        crate::core::populate_markers(&mut r.declarations, r.language);
+        return Some(r);
+    }
+
+    if ext == "zig" {
+        let mut r = crate::adapters::zig::parse_zig(path, source.as_bytes());
         crate::core::populate_markers(&mut r.declarations, r.language);
         return Some(r);
     }

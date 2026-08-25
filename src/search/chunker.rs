@@ -10,8 +10,8 @@
 //!   iteration of named children.
 //! - **Markdown** (`.md`/`.markdown`/`.mdx`/`.mdown`) — split at `section`
 //!   boundaries via raw `tree_sitter_md`.
-//! - **Plain text** (`.toml`, PowerShell `.ps1`/`.psm1`/`.psd1`) — formats
-//!   with no tree-sitter grammar in `SupportLang`; split at blank-line
+//! - **Plain text** (`.toml`, `.zig`, PowerShell `.ps1`/`.psm1`/`.psd1`) —
+//!   formats with no tree-sitter grammar in `SupportLang`; split at blank-line
 //!   boundaries (LF or CRLF). Files without blank lines become one oversized
 //!   chunk, which the packer already tolerates. Note: sources must be UTF-8 —
 //!   UTF-16-encoded `.ps1` files fail `read_to_string` and are skipped, like
@@ -102,7 +102,7 @@ impl ChunkerKind {
 /// Decide whether `path` is indexable, and how.
 ///
 /// Returns `Some(Markdown)` for `.md`/`.markdown`/`.mdx`/`.mdown` (handled via
-/// `tree_sitter_md`), `Some(Plain(_))` for `.toml` and PowerShell
+/// `tree_sitter_md`), `Some(Plain(_))` for `.toml`, `.zig`, and PowerShell
 /// `.ps1`/`.psm1`/`.psd1` (blank-line-delimited plain text),
 /// `Some(AstGrep(lang))` for any extension ast-grep claims it can parse, and
 /// `None` otherwise.
@@ -116,6 +116,9 @@ pub fn is_indexable(path: &Path) -> Option<ChunkerKind> {
     }
     if ext.as_deref() == Some("toml") {
         return Some(ChunkerKind::Plain("toml"));
+    }
+    if ext.as_deref() == Some("zig") {
+        return Some(ChunkerKind::Plain("zig"));
     }
     if matches!(ext.as_deref(), Some("ps1" | "psm1" | "psd1")) {
         return Some(ChunkerKind::Plain("powershell"));
@@ -151,8 +154,8 @@ pub fn chunk_source(source: &str, file_path: &str, kind: ChunkerKind) -> Vec<Chu
     let lang = match kind {
         ChunkerKind::AstGrep(lang) => lang,
         ChunkerKind::Plain(_) => {
-            // Blank-line paragraphs, and nothing to synthesize an outline
-            // from: a TOML or PowerShell file declares no members.
+            // Blank-line paragraphs; this strategy has no syntax tree from
+            // which to synthesize an outline.
             let points = paragraph_split_points(source);
             return pack(source, file_path, &lang_name, &lines, &points, ChunkKind::Source, "");
         }
@@ -1831,6 +1834,10 @@ content c
             is_indexable(&PathBuf::from("Cargo.toml")),
             Some(ChunkerKind::Plain("toml"))
         );
+        assert_eq!(
+            is_indexable(&PathBuf::from("src/main.ZIG")),
+            Some(ChunkerKind::Plain("zig"))
+        );
         for ext in ["ps1", "psm1", "psd1"] {
             assert_eq!(
                 is_indexable(&PathBuf::from(format!("script.{ext}"))),
@@ -1838,6 +1845,29 @@ content c
                 "expected .{ext} to map to the plain powershell chunker"
             );
         }
+    }
+
+    #[test]
+    fn zig_uses_plain_blank_line_chunking() {
+        let function = |name| {
+            format!(
+                "fn {name}() void {{\n    // {}\n}}\n",
+                "padding ".repeat(120)
+            )
+        };
+        let src = [function("alpha"), function("beta"), function("gamma")].join("\n");
+        let kind = is_indexable(&PathBuf::from("src/main.zig")).unwrap();
+
+        let chunks = chunk_source(&src, "src/main.zig", kind);
+
+        assert_eq!(chunks.len(), 3, "one chunk per oversized paragraph");
+        assert!(chunks.iter().all(|chunk| chunk.language == "zig"));
+        assert!(chunks.iter().all(|chunk| chunk.kind == ChunkKind::Source));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.content.matches("fn ").count() == 1));
+        let joined: String = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
+        assert_eq!(joined, src, "plain chunks must cover the source exactly");
     }
 
     #[test]

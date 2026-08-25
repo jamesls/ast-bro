@@ -1,6 +1,6 @@
 # Call graph
 
-Three subcommands — `callers`, `callees`, and `trace` — and a per-repo persistent call-graph cache that rides inside the same on-disk file as the dep graph. This page documents the internal architecture. See the README for the user-facing surface. The file-level import graph that the call-graph resolver leans on for disambiguation is covered in [deps.md](deps.md). For what gets walked see [file-filtering.md](file-filtering.md).
+`callers`, `callees`, and `trace` share a persistent per-repository call graph with the dependency graph. This page documents the internal architecture. See the README for the user-facing commands, [deps.md](deps.md) for the file-level import graph used during disambiguation, and [file-filtering.md](file-filtering.md) for file selection.
 
 ## What it answers
 
@@ -9,17 +9,17 @@ Three subcommands — `callers`, `callees`, and `trace` — and a per-repo persi
 | Target kind | `callers X` | `callees X` |
 |---|---|---|
 | function / method / constructor | call sites where `X` is invoked (in-edges) | call sites inside `X`'s body (out-edges) |
-| class / struct / trait / interface / enum / record | downstream uses — implementors + constructions, including unit-struct receiver patterns (`Foo()`, `Foo::new()`, `Foo {}`, `new Foo()`) | upstream dependencies — ancestor types and the methods they declare, walked transitively via `--depth N` |
+| class / struct / trait / interface / enum / record | downstream uses: implementors and constructions, including unit-struct receiver patterns (`Foo()`, `Foo::new()`, `Foo {}`, `new Foo()`) | upstream dependencies: ancestor types and the methods they declare, walked transitively via `--depth N` |
 
-Both directions are inverses on their respective graphs. Diamond inheritance is handled. Ambiguous callers and unresolved/external callees are shown by default; `--hide-ambiguous` (callers) and `--hide-external` (callees) drop them. `callers` additionally scans for bare edges that *name* the target but were never attributed to a node (`traverse::unattributed_callers`) and lists them as possible callers — without this, a chain like `connection.getCtx().getPrefs().forDate()` whose receiver can't be typed would make `callers forDate` read `0` with nothing to suggest otherwise (issue #31).
+Both directions are inverses on their respective graphs. Diamond inheritance is handled. Ambiguous callers and unresolved or external callees are shown by default; `--hide-ambiguous` for callers and `--hide-external` for callees drop them. `callers` also scans for bare edges that name the target but were never attributed to a node (`traverse::unattributed_callers`). Without this scan, a chain such as `connection.getCtx().getPrefs().forDate()` with an unknown receiver type would make `callers forDate` report `0` with no lead to inspect (issue #31).
 
-That section is only as good as the name it keys on, so three things bound it (all in `traverse.rs` / `render.rs`):
+Three checks in `traverse.rs` and `render.rs` bound the unattributed results:
 
-- **Receiver check** — a receiver naming a *project type* other than the target's own enclosing type drops the edge. This is pass A's rule applied one layer later; receivers that are locals, parameters, or external types are kept, because rejecting on an untypeable name would drop the real `connection.close()` sites along with the noise.
-- **Discrimination gate** — `name_declarers` counts how many project symbols declare the target's terminal name. Past `render::MAX_DECLARERS_TO_LIST` (3) the rows are withheld in favour of a one-line count that states the reason, because the sites are then evidence about every declarer equally: `callers CliError.new` in this repo would otherwise print a sample of the 1020 `Vec::new()` / `String::new()` call sites, and `callers PgConnection.close` on pgjdbc a sample of 1124 (39 symbols declare `close`). JSON carries `unattributed_declarers` and `unattributed_suppressed` so a consumer can't read the total as a caller count either.
-- **Own sample cap, strongest first** — the section takes `min(--limit, 25)` rows rather than whatever budget the resolved hits left over (a badly-resolved target would otherwise earn *more* screen), ordered by ambiguity breadth ascending, and each row shows the receiver as written (`recv=os`) — the one triage signal available without type inference.
+- A receiver that names a project type other than the target's enclosing type drops the edge. Receivers that name locals, parameters, or external types remain because rejecting an unknown name would drop real `connection.close()` sites with the noise.
+- `name_declarers` counts project symbols that declare the target's terminal name. Above `render::MAX_DECLARERS_TO_LIST` (3), the renderer replaces rows with a count and reason because each site is evidence about every declarer. For example, `callers CliError.new` in this repository would otherwise sample 1,020 `Vec::new()` and `String::new()` sites. JSON includes `unattributed_declarers` and `unattributed_suppressed` so consumers cannot mistake this total for a caller count.
+- The section takes `min(--limit, 25)` rows, independent of the resolved-hit budget. It orders rows by ascending ambiguity breadth and shows the receiver as written (`recv=os`), which supports triage without type inference.
 
-The remaining work for the fully-resolved case is recording declared types of locals and parameters during the adapter walk (`ResultSet rs = …`, `void f(PgConnection c)`), which is a field, not type inference.
+Resolving the remaining sites requires adapters to record declared local and parameter types such as `ResultSet rs = ...` and `void f(PgConnection c)`. This information is explicit syntax, not inferred type flow.
 
 Symbol forms accepted by both subcommands:
 
@@ -40,24 +40,24 @@ build_call_graph(root, deps):
     pass = extract_file(file, lang)         # adapter walks tree-sitter tree:
                                             #   Declaration::calls   (raw CallSites)
                                             #   ParseResult::imports (ImportBindings)
-    aggregate(pass) → Vec<FilePass>
+    aggregate(pass) -> Vec<FilePass>
 
-  symbol_table = build_symbol_table(passes) # name → Vec<Qn> (terminal segment)
+  symbol_table = build_symbol_table(passes) # name -> Vec<Qn> (terminal segment)
 
   for each raw edge:
-    pass A — same-file:                     # bare name → qn via local
+    pass A: same-file                       # bare name -> qn via local
                                             #   defined_names + ImportBindings,
                                             #   resolved through suffix index
-    pass B — global symbol table:           # single-match promotion;
+    pass B: global symbol table             # single-match promotion;
                                             #   receiver-bearing calls deferred
                                             #   to pass C (avoids
                                             #   `builder.hidden()` false hits
                                             #   on global homonyms)
-    pass C — dep-graph disambiguation:      # filter ambiguous candidates
+    pass C: dep-graph disambiguation        # filter ambiguous candidates
                                             #   by the caller's transitive
                                             #   forward-dep closure
 
-  → CallGraph {
+  -> CallGraph {
        forward, callable_meta, types,
        symbol_table, type_by_name,
        implementors, stats,
@@ -66,7 +66,7 @@ build_call_graph(root, deps):
 callers <Sym>:                              # kind-aware:
   if callable: reverse traversal of `forward`
                + unattributed bare edges naming <Sym>
-  if type:     implementors ∪ constructions
+  if type:     implementors plus constructions
 
 callees <Sym>:                              # kind-aware:
   if callable: forward traversal of `forward`
@@ -75,9 +75,9 @@ callees <Sym>:                              # kind-aware:
 
 ## Tracing call paths (`trace`)
 
-`trace <FROM> <TO>` answers "how does `<from>` reach `<to>`?" — the chain of
+`trace <FROM> <TO>` answers "how does `<from>` reach `<to>`?" It returns the chain of
 calls between two symbols, with each hop's source body inlined so a flow
-question (request→handler, update→render) is answered in **one** call instead
+question (`request -> handler`, `update -> render`) is answered in one call instead
 of the agent manually chaining `callees`.
 
 - **Search**: a multi-source / multi-target BFS over `forward` (the callees
@@ -88,16 +88,16 @@ of the agent manually chaining `callees`.
 - **Bodies inlined**: each node on the path is rendered with its source,
   extracted via the same `core::find_symbols` path `show` uses (parsed files
   are cached, so a path through one file parses it once). Output is
-  size-capped — `MAX_BODY_CHARS` per symbol, `MAX_TOTAL_CHARS` total — beyond
-  which remaining hops are listed header-only.
-- **Graceful failure**: when no static path exists — the chain broke at a
-  dynamic-dispatch / framework boundary (a callback, trait object, or route
-  handler ast-bro's precise resolver won't invent an edge for) — the response
+  size-capped by `MAX_BODY_CHARS` per symbol and `MAX_TOTAL_CHARS` total. After
+  either limit, remaining hops are listed header-only.
+- **Graceful failure**: a missing static path can indicate a dynamic-dispatch
+  or framework boundary, such as a callback, trait object, or route handler for
+  which the resolver will not invent an edge. The response
   still inlines both endpoints plus the target file's sibling callables, so
   the agent has somewhere to look. A found path and a resolved-but-no-path are
   both exit 0 (the output is the answer); only an unresolved `<from>` / `<to>`
   is exit 2.
-- **JSON** (`--json`): `ast-bro.trace.v1` — `{from, to, found, frontier_truncated,
+- **JSON** (`--json`): `ast-bro.trace.v1` returns `{from, to, found, frontier_truncated,
   hop_count, hops: [{qn, file, line, kind, via, via_line, confidence, body}]}`, or
   `{found: false, frontier_truncated, endpoints, siblings}` on the no-path branch.
 - **`found: false` is two findings, not one.** The BFS stops either because it
@@ -106,35 +106,35 @@ of the agent manually chaining `callees`.
   dispatch. `frontier_truncated` separates them: the text output says "no
   static call path found within `--depth N`" and names the flag to raise, and
   the JSON field is present on both branches so a consumer reads one thing
-  either way. Only an edge into a node the search never visited counts —
+  either way. Only an edge into a node the search never visited counts;
   unresolved and external callees are where the static graph ends, so raising
   `--depth` would not walk through them (issue #32).
 
-Lives in `src/calls/trace.rs` — a thin layer over the same `CallGraph.forward`
+The implementation lives in `src/calls/trace.rs` as a thin layer over the same `CallGraph.forward`
 map `callees` walks; it needs no new IR or cache state.
 
 ## Module layout
 
 ```
 src/calls/
-├── mod.rs          orchestrator: build_call_graph(root, &DepGraph) -> CallGraph
-├── pass.rs         shared phase-1 IR: FilePass, RawEdge, qn_from, raw_to_edge,
-│                   file_rel  (lifted out of build.rs to break the
-│                   build ↔ resolve cycle — `ast-bro cycles src/calls/`
-│                   was flagging it)
-├── build.rs        per-file extraction + FilePass aggregation
-├── resolve.rs      three-pass resolver:
-│                     run = build_symbol_table → run_with_table
-│                   (the split lets the incremental updater resolve a
-│                   partial pass set against a precomputed global table)
-├── graph.rs        Qn, CallEdge, CallTarget, Confidence, CallableMeta,
-│                   TypeMeta, CallGraph, GraphStats
-├── traverse.rs     forward / reverse BFS
-├── trace.rs        shortest-path BFS between two symbols, bodies inlined
-├── render.rs       text + JSON renderers (palette matches core/surface)
-├── cli.rs          run_callers / run_callees / run_trace + type-aware paths
-├── cli_helpers.rs  kind-aware target resolution (Callable vs Type)
-└── mcp.rs          MCP server wrappers
+|-- mod.rs          orchestrator: build_call_graph(root, &DepGraph) -> CallGraph
+|-- pass.rs         shared phase-1 IR: FilePass, RawEdge, qn_from, raw_to_edge,
+|                   file_rel  (lifted out of build.rs to break the
+|                   build/resolve cycle; `ast-bro cycles src/calls/`
+|                   was flagging it)
+|-- build.rs        per-file extraction + FilePass aggregation
+|-- resolve.rs      three-pass resolver:
+|                     run = build_symbol_table -> run_with_table
+|                   (the split lets the incremental updater resolve a
+|                   partial pass set against a precomputed global table)
+|-- graph.rs        Qn, CallEdge, CallTarget, Confidence, CallableMeta,
+|                   TypeMeta, CallGraph, GraphStats
+|-- traverse.rs     forward / reverse BFS
+|-- trace.rs        shortest-path BFS between two symbols, bodies inlined
+|-- render.rs       text + JSON renderers (palette matches core/surface)
+|-- cli.rs          run_callers / run_callees / run_trace + type-aware paths
+|-- cli_helpers.rs  kind-aware target resolution (Callable vs Type)
+`-- mcp.rs          MCP server wrappers
 ```
 
 ## IR additions
@@ -144,12 +144,12 @@ Three new types in `src/core.rs` plus two new fields on the existing `Declaratio
 ```rust
 pub struct Declaration {
     // ... 18 existing fields ...
-    pub calls: Vec<CallSite>,           // direct body only — nested decls own theirs
+    pub calls: Vec<CallSite>,           // direct body only; nested decls own theirs
 }
 
 pub struct ParseResult {
     // ... 6 existing fields ...
-    pub imports: Vec<ImportBinding>,    // local-name → module spec
+    pub imports: Vec<ImportBinding>,    // local-name -> module spec
 }
 
 pub struct CallSite {
@@ -172,35 +172,37 @@ pub struct ImportBinding {
 
 ## Three-pass resolver
 
-The single biggest source of grep noise is homonyms — `helper`, `init`, `parse`, `validate` exist in dozens of files. The three passes attack the problem in increasing order of cost:
+Homonyms such as `helper`, `init`, `parse`, and `validate` create most false matches. The resolver applies three passes in increasing order of cost.
 
-### Pass A — same-file
+### Pass A resolution
 
 For each `RawEdge` whose target is a bare name:
 
-1. If the name is in the file's `defined_names` (collected from local `Declaration`s), promote to `Resolved(qn)` with `Confidence::Exact` — **but only when the receiver still points at the enclosing scope** (no receiver, or a self-like keyword: `self`/`Self`/`crate`/`super`/`this`/`$this` — PHP's `self::`/`static::`/`parent::` never reach the resolver as receivers; the adapter normalizes them to `None`, matching case-insensitively since PHP keywords are — `SELF::`/`Static::` too — and the bare words are deliberately absent from the list because `parent`/`static` are common user variable names). An explicit receiver (`connection.getCtx()`) means the target lives on another object, so a same-file homonym must not claim it (issue #31 — the mis-bind used to be tagged `Exact` and silently broke the rest of the chain). Two refinements:
-   - Self-like binding prefers the sibling under the caller's own scope: `self.shared()` inside `Greeter::caller` binds `Greeter::shared`, not another same-file class's `shared`.
-   - A type-qualified call on a local type (`Foo::bar()`, `Foo.bar()`) still binds `Exact`, but only to a local qn actually scoped as `::Foo::bar`.
-   - Rust self-relative prefixes each pick their own anchor, always by anchored equality: `self::P` starts at the caller's enclosing scope and walks up, each `super::` skips one more level first, and `crate::P` anchors at the crate root — which means the arm fires **only when the caller's file *is* `lib.rs` / `main.rs` / a `bin/` target** (`is_crate_root`). In any other file the caller's file segment is not the crate root, and anchoring there would bind `crate::inner::Foo::method()` to a same-file `mod inner` decoy while the real `crate::inner` lives in another file — i.e. the arm would fire exactly where it is wrong. Off the crate root the edge falls through to pass B/C. (Pass C can still pick a same-file decoy over the crate-root module when both are named alike; that is a resolver-level limitation, tagged `Inferred` rather than `Exact`, and wants real module-path resolution to fix.)
-   - Everything else falls through to pass B/C, where the dep graph either confirms the relationship (`Inferred`) or the edge stays honestly `Ambiguous`.
-2. Else if the name is in the file's `ParseResult::imports` **and the receiver is self-like** (the same gate — no receiver or a self/scope keyword), look up the module → file via the existing `src/deps/resolver/resolve.rs::resolve` and promote to `Resolved("<that file>::<name>")` with `Exact`.
+1. Try Zig namespace receiver imports. For `helper.work()`, pass A looks up `helper` as the local import binding, resolves its module spec to a project file, and selects a real top-level `work` declaration from that file with `Confidence::Exact`. The full receiver must equal the binding, so a receiver such as `std.debug` cannot match an import named `std`. This check runs before generic receiver handling because Zig permits imports named `self`, `this`, `crate`, and the other spellings that are keywords or conventions in other languages.
+2. Try same-file definitions. A receiverless or self-like call can bind locally. Self-like binding prefers the sibling under the caller's scope, so `self.shared()` inside `Greeter::caller` selects `Greeter::shared` instead of another class's `shared`. Zig treats only `self` and `Self` as self-like; `this`, `cls`, `crate`, and `super` remain ordinary explicit receivers. An explicit object receiver such as `connection.getCtx()` blocks bare same-file binding because the target belongs to another object (issue #31).
+   - A type-qualified call such as `Foo::bar()` or `Foo.bar()` can bind `Exact` only when a local qn has the complete `::Foo::bar` scope under the caller.
+   - Rust prefixes use anchored scopes. `self::P` starts at the caller's enclosing scope, each `super::` skips one additional level, and `crate::P` anchors at a crate root such as `lib.rs`, `main.rs`, or a `src/bin` target. A miss continues to passes B and C without terminal-name fallback.
+   - PHP scoped keywords do not arrive as receivers. The adapter normalizes case-insensitive `self::`, `static::`, and `parent::` forms to `None`. The resolver does not classify bare `static` or `parent` variables as self-like.
+3. Try direct imports. A receiverless or non-shifting self-like call whose callee matches an import binding resolves through the same dependency resolver.
 
-### Pass B — global symbol table
+Within the resolved target file, both import paths prefer the exact direct file-scope qn `<target-file>::<name>` before a nested declaration with the same terminal name. For a Zig namespace call, that direct declaration is mandatory: `helper.work()` selects `helper.zig::work`, but it neither selects `helper.zig::SomeType::work` nor invents a missing file-scope qn. Legacy direct-import resolution may still fall back to a nested declaration or a synthesized file-scope qn when an adapter did not emit a matching declaration.
+
+### Pass B symbol table
 
 `symbol_table: HashMap<String, Vec<Qn>>` indexes every project declaration's terminal name. For each remaining bare edge:
 
-- 0 candidates → leave `Bare`.
-- 1 candidate → promote to `Resolved` with `Exact`.
-- N candidates → defer to pass C.
+- 0 candidates: leave `Bare`.
+- 1 candidate: promote to `Resolved` with `Exact`.
+- N candidates: defer to pass C.
 
-**Receiver gate.** Receiver-bearing calls (`obj.bar()`, `self.x()`, `super::foo()`) are deliberately **not** promoted by pass B. With a global single-match it would be too easy for `obj.hidden()` against a generic builder pattern to claim a wildly unrelated `hidden` definition somewhere else in the project. Receiver-bearing edges always go through pass C, which can confirm the relationship via the dep graph. The exact suppression list (`self`, `Self`, `crate`, `super`, `this`, `$this` — see `receiver_is_self_like`) lives in `src/calls/resolve.rs`.
+Receiver-bearing calls such as `obj.bar()` are not promoted by pass B. A single global match could otherwise let `obj.hidden()` claim an unrelated `hidden` definition. These edges go through pass C, which can confirm a dependency relationship. `receiver_is_self_like` in `src/calls/resolve.rs` lists the self and scope forms: `self`, `Self`, `cls`, `crate`, `super`, `this`, and `$this`.
 
-### Pass C — dep-graph disambiguation
+### Pass C dependency disambiguation
 
 For each ambiguous edge with N candidates, load the dep half of the unified graph, compute the caller file's transitive forward-dep closure via `src/deps/traverse.rs::forward`, and filter the candidates to those whose file is in that closure.
 
-- Exactly 1 survives → promote to `Resolved` with `Inferred`.
-- More than 1 → keep all in `CallEdge::candidates` and tag `Ambiguous`. The renderer surfaces the count and one canonical choice; ambiguous edges are shown by default (`--hide-ambiguous` drops them).
+- Exactly 1 survives: promote to `Resolved` with `Inferred`.
+- More than 1 survives: keep all in `CallEdge::candidates` and tag the edge `Ambiguous`. The renderer shows the count and one canonical choice. Ambiguous edges are shown by default; `--hide-ambiguous` drops them.
 
 This mirrors `code-review-graph`'s `resolve_bare_call_targets` but uses the richer ast-bro dep graph instead of just IMPORTS_FROM edges.
 
@@ -218,11 +220,11 @@ Renderers colour the tag (green / yellow / red) and downstream tooling can filte
 
 ## Per-language extraction
 
-Every adapter that emits `Declaration`s now also emits `Declaration::calls`. Each adapter ships an `_extract_call_sites` (or `_walk_calls_in_body`) helper, called from inside its existing function/method/constructor walker. The walker bails on nested type or callable declarations so each `Declaration` owns exactly the calls textually inside its own body.
+Every source-code language adapter emits `Declaration::calls`. The SQL and Markdown adapters intentionally emit none. JavaScript uses the TypeScript adapter. Each participating adapter calls an `_extract_call_sites` or `_walk_calls_in_body` helper from its function, method, or constructor walker. The helper stops at nested type and callable declarations so each declaration owns only the calls in its body.
 
 | Language | AST node kinds | `Construct` source | Notes |
 |---|---|---|---|
-| Rust       | `call_expression`, `macro_invocation`, `struct_expression` | struct literal | `super::` → `CallKind::Super` |
+| Rust       | `call_expression`, `macro_invocation`, `struct_expression` | struct literal | `super::` becomes `CallKind::Super` |
 | Python     | `call` | class call (`Foo()`) | receiver from attribute access |
 | TypeScript | `call_expression`, `new_expression` | `new T()` | also serves JavaScript |
 | Java       | `method_invocation`, `object_creation_expression` | `new T()` | construct type stripped of generics + dotted prefix |
@@ -232,57 +234,50 @@ Every adapter that emits `Declaration`s now also emits `Declaration::calls`. Eac
 | C++        | `call_expression`, `new_expression` | `new T()` | `qualified_identifier` / `scoped_identifier` split on `::`; `template_function` recurses into `name`; destructor names handled |
 | Go         | `call_expression` | none (`new(T)` is just a regular call) | `selector_expression` for receivers |
 | PHP        | `function_call_expression`, `member_call_expression`, `nullsafe_member_call_expression`, `scoped_call_expression`, `object_creation_expression` | `new T()` (last `\` segment of qualified type) | `\Foo\bar()` namespace-prefixed free function drops the namespace and emits the bare name with `receiver: None` so pass B promotes it; `self::` / `static::` / `parent::` keywords drop receiver (case-folded by tree-sitter-php's `keyword()` helper); dynamic `$func()` and `new $cls()` return `None` |
-| Ruby       | `call` (with `method` / `receiver` fields) | `Foo.new` (constant receiver) | tree-sitter-ruby 0.23.1 unifies all call shapes — `obj.method()`, `obj.method "x"`, `puts "hello"`, `Greeter.shout` — under the single `call` kind. Walker deliberately does **not** bail on `block` / `do_block` (closures over the enclosing method's scope, not separate methods) |
-| SQL        | n/a — no-op by design | — | — |
-| Markdown   | n/a — no-op by design | — | — |
-
-Languages still emitting empty `Declaration::calls`: **none.** JavaScript is served by the TypeScript adapter.
+| Ruby       | `call` (with `method` / `receiver` fields) | `Foo.new` (constant receiver) | tree-sitter-ruby 0.23.1 represents `obj.method()`, `obj.method "x"`, `puts "hello"`, and `Greeter.shout` as `call`. The walker enters `block` and `do_block` because these closures use the enclosing method's scope. |
+| Zig        | `call_expression`, `struct_initializer` | typed struct literal | preserves raw `field_expression` receiver text; skips `builtin_function`; each `test` declaration owns its calls |
+| SQL        | n/a | n/a | intentionally emits no calls |
+| Markdown   | n/a | n/a | intentionally emits no calls |
 
 ### Known per-language limitations
 
-- **Ruby**: bare paren-less arg-less calls (`helper` with no parens, no args) parse as `identifier`, not `call`, so they aren't captured. Inherent to Ruby's grammar — can't disambiguate from a local variable reference at parse time.
-- **Python**: no Jedi-style receiver-type inference. `obj.method()` where `obj`'s type is inferred from runtime flow falls through to pass B/C; the bare-name + import-disambiguation pass gets most callers. Adding Jedi would mean a Python runtime dep — same trade-off doesn't fit a Rust binary.
-- **External-base ancestor walk** (`callees` on a type): capped at depth 1 when a base type doesn't resolve to a project file. Can't walk into types we can't see.
+- **Ruby**: bare calls without parentheses or arguments, such as `helper`, parse as `identifier` rather than `call`. The grammar cannot distinguish them from local variable references.
+- **Python**: the resolver has no Jedi-style receiver type inference. A call such as `obj.method()` whose receiver type depends on runtime flow falls through to passes B and C. Adding Jedi would require a Python runtime dependency.
+- **Zig named modules**: only relative `.zig` imports resolve to project files. A named `@import("mypkg")` remains external because resolving it would require evaluating the Zig program in `build.zig`.
+- **Zig grammar**: `tree-sitter-zig` 1.1.2 does not parse Zig 0.15 inline assembly clobbers such as `::: .{ .memory = true }`. The adapter reports the parse error while retaining declarations around the statement.
+- **Zig comptime dispatch**: calls selected through `@field`, inline dispatch tables, or function-pointer fields do not produce static target edges.
+- **External-base ancestor walk**: `callees` on a type stops at depth 1 when a base type does not resolve to a project file. The graph cannot traverse source it cannot see.
 
 ## Unified graph cache
 
-The call graph does **not** get its own cache file. It rides inside a unified `UnifiedGraph { deps, calls: Option<CallGraph> }` at `.ast-bro/deps/graph.bin`. The schema constant is `JSON_SCHEMA_GRAPH_INDEX = "ast-bro.graph-index.v1"`. (The directory keeps its `deps/` name even though it now holds the call graph too — renaming would force every existing user to rebuild from a new path for no benefit.)
+The call graph shares `.ast-bro/deps/graph.bin` with the dependency graph as `UnifiedGraph { deps, calls: Option<CallGraph> }`. The schema constant is `JSON_SCHEMA_GRAPH_INDEX = "ast-bro.graph-index.v2"`. The directory keeps its `deps/` name because changing the path would force a separate rebuild.
 
 ### Disk layout
 
 ```text
 .ast-bro/
-├── .gitignore             # auto-written: "*"
-├── deps/
-│   ├── graph.bin          # bincode CacheFile { schema, graph, files }
-│   └── lock               # fs2 advisory exclusive lock during writes
-└── index/                 # see search.md
-    └── ...
+|-- .gitignore             # auto-written: "*"
+|-- deps/
+|   |-- graph.bin          # bincode CacheFile { schema, graph, files }
+|   `-- lock               # fs2 advisory exclusive lock during writes
+`-- index/                 # see search.md
+    `-- ...
 ```
 
 ### Lazy promotion
 
-`deps` / `reverse-deps` / `cycles` / `graph` populate only the `deps` half — `calls` stays `None`. The first `callers` / `callees` invocation triggers `promote_calls`, which builds the call graph from the existing dep graph (no re-walk of the project) and persists the upgraded `UnifiedCacheFile` back to disk. Users who never run `callers` / `callees` never pay the call-graph build cost.
+`deps`, `reverse-deps`, `cycles`, and `graph` populate only the `deps` half, leaving `calls` as `None`. The first `callers` or `callees` invocation triggers `promote_calls`, which builds the call graph from the existing dependency graph without walking the project again. It then persists the upgraded `CacheFile`. Users who never query calls do not pay the call-graph build cost.
 
 ### Process-wide sharing
 
 `src/graph_cache/shared.rs` holds a process-wide
 `OnceLock<RwLock<HashMap<root, Entry>>>`, where each `Entry` pairs the parsed
 `Arc<UnifiedGraph>` with the `FileRecord` fingerprints it was built from.
-Within a single process — the `ast-bro mcp` long-running server is the case
-that matters — every `tools/call` goes through `get_or_init`, which:
+Within one process, every `tools/call` goes through `get_or_init`. This path is most useful to the long-running `ast-bro mcp` server. It performs three operations:
 
-- **re-validates** the cached graph against the working tree on every call (a
-  stat-only `compute_delta` against the in-memory fingerprints in the steady
-  state — no `graph.bin` re-read); an unchanged tree returns the memoised
-  `Arc` with zero re-parse,
-- on a detected edit, patches the in-memory graph via the same
-  `apply_delta_*` machinery the cold load uses and swaps the `Arc`, so a
-  long-lived session reflects edits **without** `--rebuild` (this is the fix
-  for the prior "graph frozen after first query" behaviour), and
-- serialises the slow load / patch / rebuild path behind a process-wide load
-  lock with a double-check, so concurrent callers can't both load a stale
-  graph and race on the on-disk write.
+- It validates the cached graph against the working tree on every call. In the steady state, a stat-only `compute_delta` compares in-memory fingerprints without reading `graph.bin`. An unchanged tree returns the memoised `Arc` without parsing files again.
+- When it detects an edit, it patches the in-memory graph through the same `apply_delta_*` functions used after a cold load and swaps the `Arc`. A long-lived session therefore reflects edits without `--rebuild`.
+- It serialises the slower load, patch, and rebuild path behind a process-wide lock with a double-check. Concurrent callers cannot load the same stale graph and race on the disk write.
 
 `Arc` swap on promotion or refresh means existing readers keep their prior
 view safely. For one-shot CLI invocations the registry initialises, work
@@ -290,17 +285,17 @@ happens, the process exits.
 
 ### Schema migration
 
-The legacy `deps-index.v1` cache (at `.ast-bro/deps/graph.bin`) was retired in the v2.1.0 cut. Users with an old cache hit the schema-mismatch branch in `cache::load_with_delta`, the loader returns `LoadOutcome::Missing`, and `load_or_build` rebuilds in place at `.ast-bro/deps/graph.bin` — the schema bumped (`deps-index.v1` → `graph-index.v1`), the path stayed. One-time, transparent.
+The legacy `deps-index.v1` cache was retired in v2.1.0, while the path remained `.ast-bro/deps/graph.bin`. The current schema is `ast-bro.graph-index.v2`. `cache::load_with_delta` compares the stored string with this value. A `graph-index.v1` mismatch returns `LoadOutcome::Missing`, and `load_or_build` rebuilds the cache in place.
 
-The schema bump from `graph-index.v1` to `v2` happened mid-development to fix a silent bincode round-trip bug — `#[serde(skip_serializing_if)]` on `DepEdge::local_name` / `raw_path` and `CallEdge::receiver` / `candidates` corrupts bincode's positional encoding (a skipped Option/Vec field shifts every byte that follows). The skip annotations were a JSON-output ergonomics holdover that never applied to the cache; binary positional formats *require* every field to be encoded. Removed the annotations, bumped the schema, and any v1 cache files (which were all corrupt and silently re-cold-built every invocation) get a clean rebuild.
+Version 2 also fixes a bincode round-trip bug. `#[serde(skip_serializing_if)]` on `DepEdge::local_name`, `DepEdge::raw_path`, `CallEdge::receiver`, and `CallEdge::candidates` omitted positional fields and shifted the bytes that followed. Removing those annotations and rejecting v1 ensures the next graph query writes a complete cache.
 
 ### Per-file invalidation
 
 `load_with_delta` returns a three-armed `LoadOutcome`:
 
-- `Fresh(graph)` — cache + no diff.
-- `Stale { graph, delta, prev_records }` — cache + per-file diff to apply.
-- `Missing` — schema mismatch, IO error, or decode error → caller rebuilds.
+- `Fresh(graph)`: cache with no file changes.
+- `Stale { graph, delta, prev_records }`: cache with a per-file delta to apply.
+- `Missing`: schema mismatch, I/O error, or decode error. The caller rebuilds.
 
 `load_or_build` drives the patch flow: on `Stale`, hand the delta to two sibling patchers in `src/graph_cache/delta.rs`. On patch failure, fall back to full `build_and_save` so a query never sees a half-applied state.
 
@@ -308,7 +303,7 @@ The schema bump from `graph-index.v1` to `v2` happened mid-development to fix a 
 
 1. Drop entries for removed + modified files.
 2. Re-extract + re-resolve only added + modified files (parallel via rayon, same loop the full build uses).
-3. Rebuild the suffix index once — file membership changed.
+3. Rebuild the suffix index once because file membership changed.
 4. Re-aggregate stats.
 
 **`apply_delta_to_calls`** (more careful since the call graph has cross-file edges):
@@ -316,28 +311,29 @@ The schema bump from `graph-index.v1` to `v2` happened mid-development to fix a 
 1. Drop forward entries originating in changed files.
 2. Drop changed-file qns from `callable_meta` / `types` / `symbol_table` / `type_by_name` / `implementors`. Prune empty buckets so callers don't see ghost keys.
 3. Re-extract changed files via `pass::extract_file`.
-4. Splice new qns into the live indices **before** resolving — the resolver's pass A/B for a new edge needs to see qns just added by the same delta.
+4. Splice new qns into the live indices before resolving. Passes A and B must see qns added by the same delta.
 5. Resolve only the new passes via `resolve::run_with_table` (the split-out resolver entrypoint that takes a prebuilt symbol table instead of constructing one).
-6. Validate every `Resolved` edge against the post-update qn set. Edges whose target qn no longer exists (deleted or renamed) get demoted to `Bare` with the original callee name preserved. Edges that *kept* their target — the common case for a modify without a rename — keep their original `Exact` confidence; we deliberately don't blanket-demote everything pointing into changed files because that would burn the high-trust tags for the 99% case.
-7. Bare-name re-resolution: for every `Bare` edge, look up its name in the (now updated) symbol table. Single-match, no-receiver hits promote to `Resolved/Exact` — pass B's rule *and* pass B's confidence, since parity covers the tag as well as the target (receiver suppression included); everything else goes through `resolve::disambiguate` — the *same* function pass C uses — so candidates are filtered to what the caller's file can reach through the dep graph, with a memoized per-file closure. Picks up two cases the partial path would otherwise miss: edges demoted in step 6 whose target moved to a different file, and pre-existing `Bare` edges in unchanged files that finally have a target because a *new* file in this delta defines it.
+6. Validate every `Resolved` edge against the updated qn set. If a target qn was deleted or renamed, demote its edge to `Bare` while preserving the callee name. An unchanged target keeps its `Exact` confidence, even when another declaration in the file changed.
+7. After a Zig file changes, re-extract each unchanged Zig caller file that has receiver-bearing edges and run the complete resolver on it. Namespace-import resolution needs the caller's import bindings, which the persisted `CallGraph` does not store. This refresh preserves cold-build behavior when an imported callable appears, disappears, or changes shape.
+8. Re-resolve every remaining `Bare` edge against the updated symbol table. A receiverless single match promotes to `Resolved/Exact`, matching pass B. Other edges use the same `resolve::disambiguate` function as pass C, with a memoised dependency closure per file. This step finds targets moved to another file and targets added for bare edges in unchanged files.
 
-   The invariant is parity — a partial update must produce the graph a cold build of the same content produces. This step used to assign the *unfiltered* symbol-table entry as an edge's candidate set, which broke that: it ran over the whole graph, so one edit to an unrelated file gave every bare edge in the project candidates the dep filter had ruled out. Measured on ast-bro itself, `callers CliError.new` reported 1023 unresolved sites cold and 1073 after appending a comment to `src/adapters/sql.rs` — every `Vec::new()` in the tree newly counted as a possible caller. Reusing pass C's own decision function is what keeps the two paths honest; `tests/calls_e2e.rs::incremental_update_matches_a_cold_build_of_the_same_content` pins it.
-8. Rebuild reverse adjacency + recompute stats. Both are derived; rebuilding fresh is cheaper than incremental maintenance.
+   A partial update must produce the same graph as a cold build of the same content. The previous updater assigned each edge the unfiltered symbol-table candidates. On ast-bro, appending a comment to `src/adapters/sql.rs` increased `callers CliError.new` from 1,023 unresolved sites to 1,073 because every `Vec::new()` gained a candidate that the dependency filter had rejected. Reusing pass C prevents that divergence. `tests/calls_e2e.rs::incremental_update_matches_a_cold_build_of_the_same_content` checks this invariant.
+9. Rebuild reverse adjacency + recompute stats. Both are derived; rebuilding fresh is cheaper than incremental maintenance.
 
-### Cost numbers (ast-bro against itself, release build)
+### Cache timings
 
 | operation                       | before    | after  |
 |---------------------------------|-----------|--------|
 | deps, cold                      | 2.85 s    | 2.85 s |
-| deps, warm (no edits)           | 2.85 s ⚠️ | 8 ms   |
-| deps, warm + 1 file modified    | 2.85 s ⚠️ | 22 ms  |
+| deps, warm (no edits)           | 2.85 s    | 8 ms   |
+| deps, warm + 1 file modified    | 2.85 s    | 22 ms  |
 | callers, cold                   | 125 ms    | 125 ms |
-| callers, warm (no edits)        | 125 ms ⚠️ | 11 ms  |
-| callers, warm + 1 file modified | 125 ms ⚠️ | ~45 ms |
+| callers, warm (no edits)        | 125 ms    | 11 ms  |
+| callers, warm + 1 file modified | 125 ms    | ~45 ms |
 
-⚠️ = pre-fix "warm" was actually cold every time due to the silent decode bug. The warm-no-edits row is the load-from-cache happy path that never happened until the schema-v2 cut; the warm-with-edits row is the new per-file patch path replacing full rebuild.
+The before column's warm operations fell back to cold rebuilds because the v1 cache could not decode. In v2, the no-edit rows load from cache and the modified rows apply a per-file patch.
 
-For `ast-bro mcp`, where the in-process `Arc<UnifiedGraph>` already shared parsed state across `tools/call`s, the schema-v2 fix recovers the *first* call of each session — which previously reloaded from scratch instead of deserialising the persisted cache — and makes the rest of the session correctly reflect file edits without forcing `--rebuild`.
+In `ast-bro mcp`, the in-process `Arc<UnifiedGraph>` shares parsed state across `tools/call` requests. Version 2 lets the first call load the persisted cache and lets later calls reflect file edits without `--rebuild`.
 
 ### Concurrency
 
@@ -345,7 +341,7 @@ Same pattern as the search index: `fs2` advisory exclusive lock at `.ast-bro/dep
 
 ## Known gaps
 
-- The suffix index gets a fresh full walk on every delta. The walk is the cheap part of a cold build (~hundreds of ms even on big repos); the per-file extract+resolve is the expensive part, which we now skip for unchanged files. A surgical suffix-index update would be more code than it saves.
+- The suffix index gets a fresh full walk on every delta. The walk is the cheap part of a cold build (~hundreds of ms even on big repos). Changed files are the only files re-extracted by default. After a Zig delta, the call patcher also re-extracts unchanged Zig files with receiver-bearing edges so namespace imports match a cold build. A surgical suffix-index update would be more code than it saves.
 
 ## Adding a new language
 
@@ -354,6 +350,7 @@ If you've already added a `Declaration`-emitting adapter (see [architecture.md](
 1. Add an `_extract_call_sites` (or `_walk_calls_in_body`) function in your `src/adapters/<lang>.rs` that walks the function body, bails on nested type/callable declarations, and emits one `CallSite` per recognised AST node kind.
 2. Call it from inside each `_function_to_decl` / `_method_to_decl` / `_class_to_decl` builder so the populated `calls` ride along on the returned `Declaration`.
 3. If the language has its own import syntax not already covered by `src/deps/extract.rs` and `src/surface/imports.rs`, populate `ParseResult::imports` so pass A can resolve same-file `use` / `import` / `using` bindings.
-4. Add an end-to-end test in `tests/calls_e2e.rs` mirroring the existing per-language pairs (`<lang>_callers_finds_intra_file_caller` + `<lang>_callees_lists_construct_and_invocation`). Intra-file scope keeps the failure modes narrow — it exercises pass A without depending on the per-language import resolver.
+4. Add an end-to-end test in `tests/calls_e2e.rs` that mirrors the existing per-language pair: `<lang>_callers_finds_intra_file_caller` and `<lang>_callees_lists_construct_and_invocation`. This pair exercises same-file pass A behavior without depending on import resolution.
+5. If the language supports namespace import bindings, add a cross-file `helper.work()` test with same-name decoys. Assert that pass A resolves an existing direct file-scope callable with `Exact` confidence. Also test that a nested-only homonym or missing callable remains unresolved.
 
 For languages where AST kind names are case-folded by tree-sitter (PHP's late-binding keywords, Ruby's command unification), pin the assumption with a regression test so future grammar drift surfaces as a test failure instead of silently dropping edges.

@@ -1,188 +1,202 @@
 # Dependency graph
 
-Four subcommands — `deps`, `reverse-deps`, `cycles`, `graph` — and a per-repo persistent dep-graph cache. This page documents the internal architecture. For the user-facing surface see the README. For what gets walked see [file-filtering.md](file-filtering.md). For the parallel search subsystem (which the dep graph lazily boosts via `find-related`) see [search.md](search.md).
+The dependency subsystem resolves file imports for 13 user-facing languages: Rust, Python, TypeScript, JavaScript, Scala, Java, Kotlin, C#, Go, C++, PHP, Ruby, and Zig. TypeScript and JavaScript count separately; TSX uses the TypeScript path internally.
+
+Four subcommands expose the file graph: `deps`, `reverse-deps`, `cycles`, and `graph`. The same graph supports `callers`, `callees`, `trace`, `impact`, `context`, and dependency-aware `find-related` ranking. See [file-filtering.md](file-filtering.md) for walk rules, [calls.md](calls.md) for the symbol graph, and [search.md](search.md) for semantic search.
 
 ## Pipeline
 
-```
+```text
+graph_cache::shared::get_or_init(root):
+  check the per-process registry
+  compute_delta(root, recorded_files)
+  reuse, patch, load, or build the unified graph
+
 build_graph(root):
-  detect_aliases(root)              # tsconfig paths, Cargo crate name, composer PSR-4
-  build_suffix_index(root)          # one parallel walk → SuffixIndex { by_suffix, by_file, go_modules }
-  par_iter(files):                  # rayon: per-file extract + resolve
-    raw = extract(file, lang)       # tree-sitter pass; reuses surface/imports.rs where it can
-    for ri in raw:
-      resolve(ri.spec, ctx, idx)    # one resolver, all 9 languages
-        → match → DepEdge
-        → no match → external bucket
-  dedup_edges(graph)                # collapse repeated (src, target) pairs
-  → DepGraph { forward, external, stats }
+  detect_aliases(root)              # tsconfig, Cargo, and Composer metadata
+  build_suffix_index(root)          # one filtered project walk
+  par_iter(files):                  # per-file extraction and resolution
+    raw = extract(file, lang)
+    for import in raw:
+      resolve(import.spec, ctx, idx)
+        -> match -> DepEdge
+        -> no match -> external bucket
+  dedup_edges(graph)
+  -> DepGraph { forward, external, stats }
 
-deps <file>:                        forward BFS over `graph.forward`
-reverse-deps <file>:                graph.reverse_adjacency() (computed on-demand) + BFS
-                                    both report `frontier_truncated` — see below
-cycles:                             iterative Tarjan SCC over the compact node-index graph
-graph:                              render_graph_text / render_graph_json
-
-find-related (when cache exists):
-  semantic top-(K×5) → dep-neighbour boost (1.40× / 1.20×) → top-K
+deps <file>:                        forward BFS
+reverse-deps <file>:                reverse adjacency plus BFS
+cycles:                             iterative Tarjan SCC
+graph:                              full graph renderer
 ```
+
+`build_graph` stores only forward edges. `reverse_adjacency` computes the reverse map when a caller needs it. This keeps one edge source of truth and avoids maintaining two maps during incremental updates.
 
 ## Module layout
 
-```
+```text
 src/deps/
-├── mod.rs           orchestrator: build_graph(root) -> DepGraph
-├── options.rs       DepOptions + DepError
-├── graph.rs         DepGraph, DepEdge, ImportKind, dedup_edges
-├── extract.rs       per-language extract dispatch
-├── resolver/
-│   ├── mod.rs       re-exports
-│   ├── build.rs     build_suffix_index — one parallel walk
-│   └── resolve.rs   resolve(spec, ctx, idx) → Option<PathBuf>
-├── manifest.rs      go.mod / tsconfig.json / Cargo.toml parsing
-├── scc.rs           iterative Tarjan SCC (~80 lines, no petgraph)
-├── traverse.rs      forward / reverse (+ *_info) / neighbourhood_depths
-├── cache.rs         disk persistence at .ast-bro/deps/graph.bin
-├── render.rs        text / JSON renderers
-├── cli.rs           run_deps / run_reverse_deps / run_cycles / run_graph
-└── mcp.rs           MCP wrappers
+|-- mod.rs                 graph construction
+|-- options.rs             DepOptions and DepError
+|-- graph.rs               DepGraph, DepEdge, ImportKind, dedup_edges
+|-- extract.rs             per-language import extraction
+|-- resolver/
+|   |-- build.rs           Lang, SuffixIndex, build_suffix_index
+|   |-- resolve.rs         shared resolver
+|   `-- mod.rs             re-exports
+|-- manifest.rs            tsconfig, Cargo, Composer, and go.mod parsing
+|-- scc.rs                 iterative Tarjan SCC
+|-- traverse.rs            forward, reverse, and neighbourhood walks
+|-- dsm.rs                 dependency structure matrix
+|-- render.rs              text and JSON renderers
+`-- cli.rs                 command dispatch
+
+src/graph_cache/
+|-- mod.rs                 UnifiedGraph and call-graph promotion
+|-- cache.rs               CacheFile persistence
+|-- delta.rs               per-file dependency and call graph patches
+`-- shared.rs              per-process registry keyed by repository root
 ```
 
-## Depth cutoff vs. graph end
+Cache code lives in `src/graph_cache`. The MCP handlers live in `src/mcp/tools.rs`.
 
-`--depth` (default 3) bounds both walks, and a walk that ran out of depth looks
-exactly like one that ran out of graph — which is how `reverse-deps src/core.rs
---depth 1` came to report `33 total` for a file with 54 importers (issue #32).
-`forward_info` / `reverse_info` return a `DepTraversal { hits,
-frontier_truncated }`; the plain `forward` / `reverse` wrappers stay for the
-callers that only want the hits.
+## Depth cutoff
 
-The flag is set when a file popped at the cutoff still has an edge into a file
-the walk never `seen`. Two consequences worth keeping straight:
+`--depth` bounds the forward and reverse walks. A traversal that stops at the cutoff can otherwise look like one that reached the graph's end. `forward_info` and `reverse_info` return `DepTraversal { hits, frontier_truncated }` so renderers can distinguish those outcomes.
 
-- **An edge back into visited territory does not count.** Otherwise the
-  raise-`--depth` hint would be a lie on any cyclic import graph.
-- **Predicate-rejected edges do count.** `--exclude-tests` filters what gets
-  *reported*, not what gets *expanded* — a test file at the cutoff can still
-  lead to a non-test importer deeper — so the frontier question is about
-  traversal, not about the display.
+`frontier_truncated` becomes true when a file at the cutoff has an edge to an unseen file. An edge back to a visited file does not count. A predicate-rejected edge does count because filters such as `--exclude-tests` control reporting, while traversal can still continue through the rejected file.
 
-`frontier_truncated` is orthogonal to `truncated`, which is what `--limit` sets:
-`truncated: false` with `frontier_truncated: true` says nothing was cut from the
-display and `total` itself counts only part of the cone. Text mode prints
-`render::frontier_note` on stderr; MCP, which has one channel, prepends the same
-string to the response body. Unlike `callers` / `callees`, the note is *not*
-suppressed at low depth: those default to 1, where "the callers have callers" is
-the norm, while an import cone running past three hops is a fact about the file.
+`frontier_truncated` is separate from `truncated`. The first describes the `--depth` boundary. The second reports a `--limit` display cap. Text commands print `render::frontier_note` on stderr. MCP prepends the same note to its single response channel.
 
-## Suffix-index resolver
+## Suffix index
 
-Single shared resolver with per-call language hints — much smaller than nine per-language resolvers and just as accurate.
+`build_suffix_index` walks every supported source file and maps each extensionless path suffix to an absolute path:
 
-For every source file `a/b/c.<ext>` we index every path-suffix of the file (without extension) → absolute path:
-
-```
-src/deps/cli.rs   →   indexes "src/deps/cli", "deps/cli", "cli"
+```text
+src/deps/cli.rs -> "src/deps/cli", "deps/cli", "cli"
 ```
 
-Plus three language-specific augmentations:
+The index uses `HashMap<String, Vec<PathBuf>>` because one repository can contain several files with the same suffix. `pick_closest` chooses the candidate that shares the most leading path components with the importer, then breaks ties lexicographically.
 
-| Language | Extra index entries |
+The walk adds language metadata beyond ordinary path suffixes:
+
+| Language | Extra metadata or index entries |
 |---|---|
-| Python `__init__.py` | parent dir (`pkg/__init__.py` → `pkg`, `pkg/__init__`) so `import a.b` finds `a/b/__init__.py` |
-| Java / Kotlin / Scala / C# | `<package>/<TypeName>` for every top-level type, parsed from each file's `package` / `namespace` declaration |
+| Python | `__init__.py` also indexes its package directory and final package name. |
+| Java, Kotlin, Scala, C# | Each top-level type adds a `<package>/<TypeName>` entry. |
+| Go | Every `go.mod` contributes a module path and its repository-relative directory to `SuffixIndex::go_modules`. |
 
-Storage: `HashMap<String, SmallVec<[PathBuf; 2]>>`. Multi-value because suffix collisions happen (`utils.py` may exist in two packages); `pick_closest` breaks ties by max common-prefix length with the importer. Built once per `build_graph` call (single parallel walk via `WalkBuilder` + rayon).
+A cold graph build runs the filtered suffix-index walk once. A dependency delta patch rebuilds the index when added or modified files need extraction. Per-file extraction and resolution then run in parallel with rayon.
 
-## Per-language extract
+## Import extraction
 
-`src/deps/extract.rs` dispatches on the file's `Lang` and produces `Vec<RawImport>`. Where possible it reuses extractors that already exist for the `surface` subsystem (Rust / Python / TS / Scala in `src/surface/imports.rs`); the four newer languages get their own tree-sitter passes inline.
+`src/deps/extract.rs` dispatches on `Lang` and returns `Vec<RawImport>`. Each record carries a normalized `spec`, `ImportKind`, source line, original path, and optional local binding.
 
-| Lang | AST nodes walked | Source |
-|---|---|---|
-| Rust | `use_declaration`, `mod_item` (`#[path]` aware) | `surface::imports::extract_rust_imports` |
-| Python | `import_from_statement`, `import_statement`, `__all__` | `surface::imports::extract_python_imports` + bare-`import` pass |
-| TS/JS | `import_statement` (with `import_clause`/`namespace_import`/`named_imports`), `export_statement`, top-level `require()` calls | new pass in `extract.rs` |
-| Scala | `import_declaration` with selector lists `{a => b, _}`, descends into bodies | new pass in `extract.rs` |
-| Java | `import_declaration` (regular + `static`, `.*` glob, inner-class trailing-segment) | new pass in `extract.rs` |
-| Kotlin | `import_header` / `import_directive` (with `as Quux`, `.*` glob) | new pass in `extract.rs` |
-| C# | `using_directive` (`using A = X.Y;` aliases, `using static`, namespace bodies) | new pass in `extract.rs` |
-| Go | grouped `import (...)` + single `import_spec`; `go.mod` `module` directive | new pass in `extract.rs` |
+| Language | Extracted forms |
+|---|---|
+| Rust | `use` trees and external `mod` declarations, including `#[path]`. |
+| Python | `import`, `from ... import`, aliases, globs, and `__all__`. |
+| TypeScript | Imports, re-exports, top-level `require()` calls, named bindings, and namespace bindings. TSX uses this extractor. |
+| JavaScript | Imports, re-exports, top-level `require()` calls, named bindings, and namespace bindings. |
+| Scala | Import declarations, selector lists, aliases, and globs. |
+| Java | Regular and static imports, globs, and nested-type paths. |
+| Kotlin | Import directives, `as` aliases, and globs. |
+| C# | `using` directives, aliases, static imports, and namespace bodies. |
+| Go | Single and grouped import specifications. |
+| C++ | Quoted and angle-bracket `#include` directives, including includes inside common preprocessor wrappers. |
+| PHP | Namespace `use` forms, grouped imports, aliases, and literal `require` or `include` variants. |
+| Ruby | Literal `require`, `require_relative`, `load`, and `autoload` calls. |
+| Zig | Every literal `@import("spec")` on a line, with an optional `const` binding. |
 
-Each `RawImport` carries `spec` (slash-joined module path), `kind`, source `line`, `local_name` (for `as Quux` / `using A = X.Y` aliases), and the original dotted path (`raw_path`).
+Zig preserves import bindings for both graph layers. For `const helper = @import("util/helper.zig");`, dependency extraction records `local_name = "helper"` and normalizes the file spec to `./util/helper.zig`. The Zig adapter also emits `ImportBinding { local: "helper", module: "./util/helper.zig" }`. Call resolution maps `helper.work()` to `helper.zig::work` only when the imported file declares `work` at file scope. `@embedFile` is an asset reference and is not extracted.
 
 ## Resolution rules
 
-`resolve(spec, ctx, idx)` — one function for everyone, branched by `ctx.lang`:
+`resolve(spec, ctx, idx)` handles all 13 languages. Specs beginning with `./` or `../` first use path arithmetic relative to the importing file.
 
-- **Rust**: `crate::x::y` strips `crate::` → suffix lookup with progressive trailing-segment dropping; `self::` and `super::` resolve relative to the importer's directory; otherwise treats as a bare path.
-- **Python**: relative paths (`./x` / `../x`) walk from the importer's parent dir; tries `.py` / `.pyi` / `__init__.py`. Falls back to dropping the trailing imported-name segment when the full path doesn't resolve (so `from .helpers import greet` finds `helpers.py`, not `helpers/greet.py`).
-- **TS/JS**: relative `./x` walks the importer's parent; tries extensions in order `.ts → .tsx → .mts → .cts → .d.ts → .js → .jsx → .mjs → .cjs → .json`, then `index.*`. Bare specifiers consult `tsconfig.json` `compilerOptions.paths` aliases via `manifest::parse_tsconfig_paths`. Anything still unresolved → external bucket.
-- **Java / Kotlin / Scala / C#**: dot→slash transform, then suffix lookup against the FQN-augmented index. Inner-class fallback: on miss, strip the trailing segment and retry (handles `import com.foo.Bar.Inner` → `com/foo/Bar`).
-- **Go**: strips the `go.mod` module-name prefix, then locates any source file inside the resulting directory (directory-as-package semantics). An import equal to the module path names the package in the module directory itself — the layout of most single-package libraries — and resolves there; the remainder must start at a `/` so `example.com/dupfoo` is not read as a subpackage of `example.com/dup`. External imports without the module prefix → external bucket. The prefixes come from every `go.mod` under the root, not just `<root>/go.mod`: the graph root is the repository, and a repository may keep its module in a subdirectory or declare several. `build_suffix_index` collects them during the walk it already makes, and `resolve` ranks the candidates three ways. The innermost module directory *holding the importer* comes first: that is the module the importer is part of, and Go resolves within it before looking anywhere else — a module elsewhere in the tree is a separate build even when it declares a longer path that also matches, which is what `testdata/`, a nested checkout, or a vendored copy leaves lying around. Longest module path then decides among the candidates that hold the importer in none of their directories, and there a nested module wins over the one containing it. Equal prefixes are then ranked by distance from the importer, the same rule `pick_closest` applies to suffix hits: one root can hold two copies of a module, and an import must not cross into the other copy. A candidate whose directory holds no matching package is skipped rather than ending the search, since a nested module's path need not mirror its directory.
+- Rust strips `crate::` and uses suffix lookup with trailing-segment fallback. `self::` and repeated `super::` prefixes resolve from the importer's directory.
+- Python relative imports probe `.py`, `.pyi`, and `__init__.py`. If the final imported name is not a file, the resolver drops that segment and retries the containing module.
+- TypeScript relative imports probe `.ts`, `.tsx`, `.mts`, `.cts`, `.d.ts`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.json`, and matching `index` files. Bare imports can use root `tsconfig.json` `compilerOptions.paths` aliases.
+- JavaScript uses the same file probing and `tsconfig.json` alias rules as TypeScript.
+- Java, Kotlin, Scala, and C# convert dotted names to slash paths and query the type-augmented suffix index. A miss drops the final segment once to handle nested types.
+- Go strips a matching `go.mod` module prefix and locates a source file in the target package directory. The resolver prefers the deepest module directory that contains the importer, then the longest module path, then the closest copy. Imports outside known module prefixes remain external.
+- C++ resolves quoted includes relative to the importer. Angle-bracket system headers remain external.
+- PHP resolves literal relative `require` and `include` paths directly. Namespace imports try Composer PSR-4 prefixes, direct suffix lookup, and a final class-name fallback.
+- Ruby resolves only `require_relative`. Extraction adds `.rb` when the source omits it. Bare `require`, `load`, and `autoload` remain external because they depend on `$LOAD_PATH` or installed gems.
+- Zig resolves only explicit relative `.zig` file imports. A spec such as `@import("helper.zig")` becomes `./helper.zig` and must name an existing file at that path. Named imports such as `std`, `builtin`, `root`, and modules configured by `build.zig` remain external because resolving them would require evaluating the build script.
 
-`pick_closest` resolves ambiguity when multiple files match a suffix — pick the candidate sharing the most leading components with the importer; break ties lexicographically. Prevents false cross-project edges in monorepos.
+Unresolved imports stay in `DepGraph::external` with their source spelling. They do not become edges to a same-named local file by guesswork.
 
-## Iterative Tarjan SCC
+## Cycle detection
 
-`src/deps/scc.rs` runs Tarjan's strongly-connected-components algorithm with an explicit work stack instead of recursion. ~80 LOC, no `petgraph` dependency. Stack-safe on huge dep chains.
+`src/deps/scc.rs` runs Tarjan's strongly connected components algorithm with an explicit work stack.
 
-Output: `Vec<Cycle>`. Filter rule:
+- Components with more than one member are cycles.
+- A one-member component is a cycle only when the file has a self-edge.
+- Other one-member components are discarded.
 
-- SCCs with `len > 1` → kept (real cycles).
-- Singleton SCCs → kept iff the node has a self-edge.
-- All others dropped.
+Cycles sort by member count in descending order. Members within each cycle sort lexicographically, which keeps text and JSON output stable.
 
-Cycles sort by member count descending; members within each cycle sort lexicographically — stable for diffs and snapshot tests.
+## Unified cache
 
-## Caching
+`src/graph_cache/cache.rs` stores a bincode-encoded `CacheFile` at `.ast-bro/deps/graph.bin`:
 
-Disk format: `.ast-bro/deps/graph.bin` (bincode-serialized `CacheFile = { schema, graph, files }`). Sibling to `.ast-bro/index/`. The `.ast-bro/.gitignore` written by the search subsystem (`*` content) covers it for free.
-
-Refresh strategy: load → run `search::cache::compute_delta` against the recorded `Vec<FileRecord>`. If any file's `(mtime, size)` changed (cheap path) or its `xxhash3-64` differs (expensive path, only on size/mtime mismatch) — full rebuild. Same "any-delta = full rebuild" simplification the search index uses today; partial-rebuild is a v2 swap-in.
-
-Schema constant: `JSON_SCHEMA_DEPS_INDEX = "ast-bro.deps-index.v1"`. Bumped on any `DepGraph` / `DepEdge` shape change to force a rebuild via the schema-mismatch branch in `cache::load_if_fresh`.
-
-Concurrency: `fs2` advisory exclusive lock at `.ast-bro/deps/lock` during writes; atomic `.tmp` + rename so a SIGKILL mid-write leaves the previous cache intact. Same pattern as the search index.
-
-`--rebuild` on any of the four CLI subcommands forces a fresh build regardless of staleness.
-
-## find-related dep boost
-
-Wired into `src/search/index.rs::find_related_opts` (called by the public `find_related` with `dep_boost = true, dep_depth = 2` defaults).
-
-Flow:
-
-1. Resolve source chunk + build language mask (existing).
-2. Pull a wider candidate window (`top_k × 5`) so the boost can promote items that wouldn't be in the top-k by raw similarity.
-3. `cosine_topk` → candidates (existing).
-4. **Lazily** load the dep graph: `Index::dep_graph_cached()` consults the on-disk cache and memoises the result in an `RwLock<Option<Option<DepGraph>>>` for the lifetime of the `Index` struct. Never triggers a build; if no cache exists, the boost is silently skipped.
-5. `traverse::neighbourhood_depths(graph, source_file, dep_depth)` → `HashMap<PathBuf, usize>` (BFS over forward + reverse-on-demand adjacency).
-6. For each candidate, multiply its score by **1.40×** (depth 1) or **1.20×** (depth 2). Other depths unchanged.
-7. Re-sort, truncate to `top_k`, return.
-
-Disable per-call with `--no-dep-boost`. Configurable depth with `--dep-depth N`.
-
-## On-disk format
-
+```text
+CacheFile {
+  schema: String,
+  graph: UnifiedGraph {
+    deps: DepGraph,
+    calls: Option<CallGraph>,
+  },
+  files: Vec<FileRecord>,
+}
 ```
+
+The dependency graph is always present. The call graph starts as `None` and `promote_calls` builds and persists it when a symbol query first needs it.
+
+The cache wrapper schema is `ast-bro.graph-index.v2`. The loader treats `ast-bro.graph-index.v1` as a mismatch and performs a cold rebuild. The separate `DepGraph.schema` field still identifies the dependency payload; it does not replace the wrapper version check.
+
+`search::cache::compute_delta` compares the recorded files with the working tree. It uses path membership plus mtime and size checks, and hashes a file when metadata changes. A stale cache goes through `apply_delta_to_deps`. That function removes entries for changed files, rebuilds the suffix index, re-extracts added or modified files, and recomputes dependency statistics. If `UnifiedGraph.calls` is present, `apply_delta_to_calls` patches the symbol graph against the updated dependency graph. A dependency patch failure falls back to a cold build.
+
+`graph_cache::shared` keeps an `Arc<UnifiedGraph>` and its `FileRecord` list in a process-wide registry keyed by canonical repository root. Every `get_or_init` call runs `compute_delta` before it reuses an entry. Changed files produce a patched graph and a new `Arc`, so a long-lived MCP session does not freeze the first graph it loaded.
+
+Writes hold an `fs2` advisory lock at `.ast-bro/deps/lock` and replace `graph.bin` through a temporary file. The graph cache also creates `.ast-bro/.gitignore` with `*` when needed. `--rebuild` bypasses the saved graph and builds a new dependency half.
+
+## find-related boost
+
+`Index::find_related_opts` uses dependency distance to rerank semantic neighbors when `dep_boost` is enabled.
+
+1. Resolve the source chunk and restrict candidates to the same language and optional query scope.
+2. Pull up to `top_k * 5` candidates by cosine similarity.
+3. On the first boosted query for an `Index`, `dep_graph_cached` calls `graph_cache::shared::get_or_init`. That call can reuse a fresh graph, patch a stale graph, load `graph.bin`, or build a missing graph.
+4. Cache the resulting `DepGraph` clone for the lifetime of the `Index`. If graph loading or construction fails, continue without the dependency boost.
+5. Run `neighbourhood_depths` over forward and reverse adjacency.
+6. Multiply depth-1 scores by `1.40` and depth-2 scores by `1.20`. Other distances keep their original scores.
+7. Sort again and truncate to `top_k`.
+
+Use `--no-dep-boost` to skip graph access. `--dep-depth N` changes the neighborhood depth.
+
+## On-disk files
+
+```text
 .ast-bro/
-├── .gitignore             # auto-written: "*"
-├── deps/
-│   ├── graph.bin          # bincode CacheFile { schema, graph, files }
-│   └── lock               # fs2 advisory exclusive lock during writes
-└── index/                 # see search.md
-    └── ...
+|-- .gitignore             "*"
+|-- deps/
+|   |-- graph.bin          CacheFile { schema, graph, files }
+|   `-- lock               fs2 advisory lock
+`-- index/                 semantic search index
 ```
 
-Loader refuses if `CacheFile.schema != JSON_SCHEMA_DEPS_INDEX`.
+The graph file contains both graph layers. The directory keeps its historical `deps` name so existing repositories do not move the cache to a second location.
 
-## Adding a new language
+## Adding a language
 
-1. Add a variant to `Lang` in `src/deps/resolver/build.rs` and a case in `Lang::from_path` for its file extensions.
-2. Add an arm to the `match` in `src/deps/extract.rs::extract` returning `Vec<RawImport>` for the new language.
-3. If the language has FQN-based imports (`com.foo.Bar`), add it to the `Lang::Java | Lang::Kotlin | Lang::Scala | Lang::CSharp` branches in `extract_package_and_types` (build.rs) and the resolver (resolve.rs).
-4. If the language has a manifest-driven module prefix (like Go's `go.mod`), add a parser to `src/deps/manifest.rs` and a branch in `resolve.rs`. A manifest that can appear anywhere in the tree — not only at the root — is collected in `build_suffix_index`'s walk, the way `go_modules` is.
-5. Add a fixture under `tests/fixtures/deps/<lang>_<scenario>/` and an integration test in `tests/deps_e2e.rs`.
+1. Add a `Lang` variant and extension cases in `src/deps/resolver/build.rs::Lang::from_path`.
+2. Add an extraction arm in `src/deps/extract.rs::extract`. Preserve the source path and local binding when the language exposes one.
+3. Add resolver logic in `src/deps/resolver/resolve.rs`. Extend `src/deps/manifest.rs` and `SuffixIndex` when resolution depends on project metadata.
+4. Add the extension to `search::chunker::is_indexable`. Graph fingerprints come from `search::cache::compute_delta`, which only tracks files that `is_indexable` recognizes. Missing this step makes edits invisible to cache invalidation.
+5. If calls should cross imports, make the language adapter emit matching `ImportBinding` records. See [calls.md](calls.md) for call-site extraction and resolution.
+6. Add fixtures under `tests/fixtures/deps/` and integration coverage in `tests/deps_e2e.rs`. Include forward, reverse, external, and cycle cases that fit the language.
+7. Add an incremental-cache regression that edits a file and reruns a graph query without `--rebuild`.
 
-The four "FQN" languages (Java, Kotlin, Scala, C#) all share the same suffix-index code path — adding a similar one (e.g. F#) is mostly an `extract` pass plus a one-line resolver case.
+Java, Kotlin, Scala, and C# share the fully qualified type index. A new language with the same import model can reuse `extract_package_and_types` and the matching resolver branch.
