@@ -4,6 +4,7 @@
 //! symmetric. Both directions traverse over `CallEdge`s.
 
 use crate::calls::graph::{CallEdge, CallGraph, CallTarget, Qn};
+use crate::symbol_path::{last_qualified_separator, last_unquoted_any};
 use crate::UNLIMITED;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
@@ -224,16 +225,17 @@ pub fn name_declarers(graph: &CallGraph, targets: &[Qn]) -> usize {
 /// (`Foo\Bar::m()`, `a.b.C.m()`, `a::b::C::m()` all yield `C`).
 fn receiver_tail(recv: &str) -> &str {
     let recv = recv.trim();
-    recv.rsplit(['\\', '.', ':']).next().unwrap_or(recv)
+    last_unquoted_any(recv, b"\\.:")
+        .map_or(recv, |index| &recv[index + 1..])
 }
 
 /// Enclosing-scope segment of a qn (`a/b.rs::Foo::method` → `Foo`), or
 /// `None` for a free function whose only scope is the file.
 fn enclosing_scope(qn: &Qn) -> Option<&str> {
     let s = qn.as_str();
-    let name_start = s.rfind("::")?;
+    let name_start = last_qualified_separator(s)?;
     let scope = &s[..name_start];
-    match scope.rfind("::") {
+    match last_qualified_separator(scope) {
         Some(i) => Some(&scope[i + 2..]),
         // Only the file segment is left — a free function has no type scope.
         None => None,

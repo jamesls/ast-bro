@@ -58,7 +58,7 @@ benches/data/
 `search`, `find-related`, `index`, and unified graph-cache fingerprints require an extension recognized by `chunker::is_indexable`. Graph fingerprints reuse `search::cache::compute_delta`, so this gate also decides whether an edit can invalidate dependency and call caches. A recognized file can use syntax-aware or plain-text chunking:
 
 - Anything `ast-grep` can parse (`.rs`, `.py`, `.pyi`, `.ts`/`.tsx`/`.js`/`.jsx`/`.mjs`/`.cjs`, `.java`, `.cs`, `.go`, `.kt`/`.kts`, `.scala`/`.sc`, `.bash`/`.sh`, `.cpp`/`.hpp`/`.c`/`.h`, `.css`, `.dart`, `.ex`/`.exs`, `.hs`, `.hcl`, `.html`, `.json`, `.lua`, `.nix`, `.php`, `.rb`, `.swift`, `.yaml`/`.yml`, `.sol`)
-- Native adapter formats: Markdown (`.md`, `.markdown`, `.mdx`, `.mdown`) and Zig (`.zig`). Search chunks Markdown at sections with a raw tree-sitter parser and chunks Zig at blank-line boundaries.
+- Native adapter formats: Markdown (`.md`, `.markdown`, `.mdx`, `.mdown`) and Zig (`.zig`). Search chunks Markdown at sections and chunks Zig structurally by declarations, nested members, and oversized callable bodies; both use direct tree-sitter parsers.
 - Other plain-text formats with no tree-sitter grammar: `.toml` and PowerShell (`.ps1`/`.psm1`/`.psd1`), chunked at blank-line boundaries (LF or CRLF)
 
 Unknown extensions such as `.txt`, image formats, and font formats are skipped before search opens them. Recognized generated or minified files are not excluded by name; ranking applies a penalty instead.

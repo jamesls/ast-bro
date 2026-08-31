@@ -26,7 +26,7 @@ Modern coding agents explore codebases by reading files directly. On a 1000-line
 [ast-bro](https://github.com/aeroxy/ast-bro) collapses each of those questions into a single command:
 
 1. **Shape over bytes.** `map` / `digest` / `show` give you signatures and line ranges instead of method bodies, typically saving **95% of the tokens** required to read the file. `implements` finds subclasses without `grep` false positives.
-2. **Published API in one call.** `surface` resolves `pub use` re-exports (Rust), `__all__` (Python), barrel files (TypeScript), and `export` clauses (Scala), so you see the API available to downstream users.
+2. **Published API in one call.** `surface` resolves `pub use` re-exports (Rust), `__all__` (Python), barrel files (TypeScript), `export` clauses (Scala), and public `const` facades plus legacy `pub usingnamespace` composition (Zig), so you see the API available to downstream users.
 3. **Dependency graph for free.** `deps` / `reverse-deps` / `cycles` / `graph` build a file-level import graph for 13 languages: Rust, Python, TypeScript, JavaScript, Java, C#, Kotlin, Scala, Go, C++, PHP, Ruby, and Zig. The shared cache lives at `.ast-bro/deps/graph.bin`. Use `reverse-deps` before refactoring to find affected files. `cycles` exits non-zero for a CI gate, and `graph` emits text or JSON.
 4. **Symbol-level call graph.** `callers` / `callees` answer "who calls X" and "what does X call" across 13 source-code languages without matches from comments or string literals. SQL and Markdown are shape-only adapters and do not emit call edges. Both commands are kind-aware: functions return call sites, while types return implementors, constructions, or ancestors. A three-pass resolver (same-file -> global symbol table -> dep-graph disambiguation) tags every edge `Exact`, `Inferred`, or `Ambiguous`. `trace <FROM> <TO>` returns the shortest static call path between two symbols and includes each hop's body. The call graph uses the same on-disk cache as the dep graph.
 5. **Hybrid semantic search.** `search` runs BM25 + dense embeddings via [`potion-code-16M`](https://huggingface.co/minishlab/potion-code-16M) (a static, no-inference model: ~64 MB, runs on CPU in microseconds). `find-related` returns structurally similar chunks and loads the dependency graph lazily for neighborhood-aware ranking.
@@ -202,7 +202,7 @@ ast-bro show 'src/**/*.cs' TakeDamage
 ast-bro digest src/Services
 
 # True public surface (resolves `pub use` / `__all__`, not every `pub` item)
-ast-bro surface .                  # auto-detect Cargo.toml / pyproject.toml / __init__.py
+ast-bro surface .                  # auto-detect Cargo.toml / pyproject.toml / __init__.py / build.zig
 ast-bro surface --tree --include-chain mycrate/
 
 # Every class that inherits/implements a given type
@@ -699,7 +699,7 @@ Symbol forms accepted by both: bare suffix (`TakeDamage`), dotted (`Player.TakeD
 
 Every edge carries a `Confidence` tag: `Exact` (passes A/B), `Inferred` (pass C narrowed to one), or `Ambiguous` (multiple candidates survive). Ambiguous callers and unresolved/external callees are shown by default (tagged); `--hide-ambiguous` (callers) and `--hide-external` (callees) drop them when you want the cleaner bucket.
 
-**Cache.** The call graph uses the same `.ast-bro/deps/graph.bin` as the dep graph and builds lazily, so `deps` / `cycles` users do not pay the call-extraction cost. Per-file invalidation normally re-extracts only edited files. After a Zig edit, it also refreshes unchanged Zig callers with receiver-bearing edges so namespace imports match a cold build.
+**Cache.** The call graph uses the same `.ast-bro/deps/graph.bin` as the dep graph and builds lazily, so `deps` / `cycles` users do not pay the call-extraction cost. Per-file invalidation normally re-extracts only edited files. After any indexed source change, it also refreshes every unchanged Zig caller file so namespace aliases and receiver types match a cold build.
 
 For internals (per-language node-kind tables, the call-shape pitfalls each adapter handles, the per-file patch path, cost numbers) see the [calls wiki page](https://github.com/aeroxy/ast-bro/blob/main/wiki/calls.md) on GitHub.
 

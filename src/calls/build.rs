@@ -16,6 +16,9 @@ use crate::calls::resolve;
 use crate::core::{CallSite, Declaration, DeclarationKind};
 use crate::deps::DepGraph;
 use crate::main_helpers::parse_file_for_hook;
+use crate::symbol_path::{
+    first_unquoted_byte, last_qualified_separator, last_unquoted_byte,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -98,16 +101,16 @@ pub fn build_call_graph(root: &Path, deps: &DepGraph) -> CallGraph {
 /// `LanguageAdapter<T>`, and `LanguageAdapter` all hash to the same key.
 fn normalise_type_name(name: &str) -> String {
     let mut name = name.trim();
-    if let Some(i) = name.find('<') {
+    if let Some(i) = first_unquoted_byte(name, b'<') {
         name = &name[..i];
     }
-    if let Some(i) = name.find('[') {
+    if let Some(i) = first_unquoted_byte(name, b'[') {
         name = &name[..i];
     }
-    if let Some(i) = name.rfind('.') {
+    if let Some(i) = last_unquoted_byte(name, b'.') {
         name = &name[i + 1..];
     }
-    if let Some(i) = name.rfind("::") {
+    if let Some(i) = last_qualified_separator(name) {
         name = &name[i + 2..];
     }
     name.to_string()

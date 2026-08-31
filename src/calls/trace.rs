@@ -15,6 +15,7 @@ use std::path::Path;
 use crate::calls::cli_helpers::resolve_target_qns;
 use crate::calls::graph::{CallEdge, CallGraph, CallTarget, Qn};
 use crate::core::{ParseResult, JSON_SCHEMA_TRACE};
+use crate::symbol_path::{first_qualified_separator, qualified_to_dotted};
 
 /// Total inlined-body budget for one trace response. Beyond this, remaining
 /// hops are listed header-only with a note.
@@ -162,8 +163,8 @@ fn reconstruct(target: &Qn, parent: &HashMap<Qn, (Qn, CallEdge)>) -> Found {
 /// `::`-joined → dotted. `src/a.rs::Foo::bar` → `Foo.bar`; a module-free fn
 /// falls back to its terminal name.
 fn qn_symbol(qn: &Qn) -> String {
-    match qn.as_str().find("::") {
-        Some(i) => qn.as_str()[i + 2..].replace("::", "."),
+    match first_qualified_separator(qn.as_str()) {
+        Some(i) => qualified_to_dotted(&qn.as_str()[i + 2..]),
         None => qn.name().to_string(),
     }
 }
@@ -601,5 +602,9 @@ mod tests {
     fn qn_symbol_dots_the_scope() {
         assert_eq!(qn_symbol(&Qn::new("src/a.rs::Foo::bar")), "Foo.bar");
         assert_eq!(qn_symbol(&Qn::new("src/a.rs::helper")), "helper");
+        assert_eq!(
+            qn_symbol(&Qn::new(r#"src/a.zig::@"Type::Name"::@"work::later""#)),
+            r#"@"Type::Name".@"work::later""#
+        );
     }
 }

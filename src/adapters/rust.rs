@@ -664,6 +664,7 @@ fn _expand_use_tree<'a, D: Doc>(
             out.push(ImportBinding {
                 local: name,
                 module: full.join("::"),
+                member_path: Vec::new(),
                 line,
             });
         }
@@ -679,6 +680,7 @@ fn _expand_use_tree<'a, D: Doc>(
                 out.push(ImportBinding {
                     local,
                     module: full.join("::"),
+                    member_path: Vec::new(),
                     line,
                 });
             }
@@ -699,7 +701,12 @@ fn _expand_use_tree<'a, D: Doc>(
                 .unwrap_or_else(|| {
                     full.last().cloned().unwrap_or_default()
                 });
-            out.push(ImportBinding { local, module, line });
+            out.push(ImportBinding {
+                local,
+                module,
+                member_path: Vec::new(),
+                line,
+            });
         }
         "use_list" | "scoped_use_list" => {
             let mut new_prefix = prefix.clone();

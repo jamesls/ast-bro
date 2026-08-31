@@ -76,10 +76,37 @@ fn tokenize(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
+    let mut preserve_quote = false;
+    let mut escaped = false;
     for c in raw.chars() {
+        if in_quote {
+            if escaped {
+                cur.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                cur.push(c);
+                escaped = true;
+            } else if c == '"' {
+                if preserve_quote {
+                    cur.push(c);
+                }
+                in_quote = false;
+                preserve_quote = false;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+
         match c {
-            '"' => in_quote = !in_quote,
-            c if c.is_whitespace() && !in_quote => {
+            '"' => {
+                preserve_quote = cur.ends_with('@');
+                if preserve_quote {
+                    cur.push(c);
+                }
+                in_quote = true;
+            }
+            c if c.is_whitespace() => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
                 }
@@ -152,5 +179,17 @@ mod tests {
         let pq = parse_query("name: thing");
         assert!(pq.names.is_empty());
         assert_eq!(pq.text, "name: thing");
+    }
+
+    #[test]
+    fn zig_escaped_identifiers_keep_their_quotes_and_grouped_spaces() {
+        assert_eq!(
+            parse_query(r#"@"work::later""#).text,
+            r#"@"work::later""#
+        );
+        assert_eq!(
+            parse_query(r#"pkg.@"Type With-Dash".run"#).text,
+            r#"pkg.@"Type With-Dash".run"#
+        );
     }
 }

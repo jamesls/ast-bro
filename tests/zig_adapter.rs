@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 const FIXTURE: &str = "tests/fixtures/zig_adapter/sample.zig";
+const ADVANCED_FIXTURE: &str = "tests/fixtures/zig_adapter/advanced.zig";
 const STALE_GRAMMAR_FIXTURE: &str = "tests/fixtures/zig_adapter/stale_grammar.zig";
 
 fn bin() -> PathBuf {
@@ -120,6 +121,9 @@ fn pub_token_controls_visibility_and_modifiers() {
     for (name, visibility) in [
         ("Widget", "public"),
         ("Hidden", "private"),
+        ("count", ""),
+        ("idle", ""),
+        ("BadInput", ""),
         ("init", "public"),
         ("reset", "private"),
         ("active", "private"),
@@ -146,6 +150,9 @@ fn pub_token_controls_visibility_and_modifiers() {
 
     let public_only = run_success(&["map", FIXTURE, "--no-private"]);
     assert!(public_only.contains("pub const Widget"), "{public_only}");
+    assert!(public_only.contains("count: usize"), "{public_only}");
+    assert!(public_only.contains("idle"), "{public_only}");
+    assert!(public_only.contains("BadInput"), "{public_only}");
     assert!(!public_only.contains("const Hidden"), "{public_only}");
     assert!(!public_only.contains("fn reset"), "{public_only}");
 }
@@ -197,4 +204,242 @@ fn stale_grammar_errors_do_not_hide_surrounding_declarations() {
             "{name} missing after recovery: {value}"
         );
     }
+}
+
+#[test]
+fn qualifiers_and_container_modifiers_are_preserved() {
+    let value = map_json(ADVANCED_FIXTURE);
+    let declarations = file_declarations(&value);
+
+    for (name, attrs) in [
+        (
+            "shared_state",
+            serde_json::json!([
+                "align(16)",
+                "addrspace(.generic)",
+                "linksection(\".shared\")"
+            ]),
+        ),
+        ("Callback", serde_json::json!(["callconv(.c)"])),
+        (
+            "qualified",
+            serde_json::json!([
+                "align(16)",
+                "addrspace(.generic)",
+                "linksection(\".text.qualified\")",
+                "callconv(.c)"
+            ]),
+        ),
+        ("bits", serde_json::json!(["align(1)"])),
+        ("ptr", serde_json::json!(["align(4096)"])),
+    ] {
+        assert_eq!(
+            find_decl(declarations, name).expect("qualified declaration")["attrs"],
+            attrs,
+            "wrong qualifiers for {name}"
+        );
+    }
+
+    for (name, modifier) in [("PackedHeader", "packed"), ("ExternHeader", "extern")] {
+        let declaration = find_decl(declarations, name).expect("container declaration");
+        assert_eq!(declaration["native_kind"], "struct");
+        assert_eq!(declaration["modifiers"], serde_json::json!([modifier]));
+    }
+    assert_eq!(
+        find_decl(declarations, "qualified").expect("qualified function")["modifiers"],
+        serde_json::json!(["extern"])
+    );
+
+    let abi_entry = find_decl(declarations, "abiEntry").expect("exported ABI entry point");
+    assert_eq!(abi_entry["visibility"], "public");
+    assert_eq!(abi_entry["modifiers"], serde_json::json!(["export"]));
+    assert!(
+        abi_entry.get("attrs").is_none(),
+        "parameter alignment must not become a function attribute: {abi_entry}"
+    );
+    let probe_fn = find_decl(declarations, "probe_fn").expect("function pointer field");
+    assert!(
+        probe_fn.get("attrs").is_none(),
+        "parameter alignment must not become a field attribute: {probe_fn}"
+    );
+}
+
+#[test]
+fn comptime_and_usingnamespace_declarations_are_surfaced() {
+    let value = map_json(ADVANCED_FIXTURE);
+    let declarations = file_declarations(&value);
+
+    let imported = find_decl(declarations, "@import(\"mixin.zig\")")
+        .expect("public usingnamespace declaration");
+    assert_eq!(imported["kind"], "field");
+    assert_eq!(imported["native_kind"], "usingnamespace");
+    assert_eq!(imported["visibility"], "public");
+
+    let named = find_decl(declarations, "Helpers").expect("named usingnamespace declaration");
+    assert_eq!(named["kind"], "field");
+    assert_eq!(named["native_kind"], "usingnamespace");
+
+    let comptime = find_decl(declarations, "comptime@L17C1").expect("top-level comptime block");
+    assert_eq!(comptime["kind"], "function");
+    assert_eq!(comptime["native_kind"], "comptime");
+    assert_eq!(comptime["modifiers"], serde_json::json!(["comptime"]));
+    assert_eq!(comptime["calls"][0]["name"], "registerTypes");
+    assert!(
+        find_decl(
+            comptime["children"].as_array().expect("comptime children"),
+            "generatedHook"
+        )
+        .is_some(),
+        "named containers inside comptime blocks should remain navigable"
+    );
+}
+
+#[test]
+fn local_callbacks_and_builtins_keep_their_call_owners() {
+    let value = map_json(ADVANCED_FIXTURE);
+    let declarations = file_declarations(&value);
+    let owner = find_decl(declarations, "owner").expect("owner function");
+    let owner_calls: Vec<_> = owner["calls"]
+        .as_array()
+        .expect("owner calls")
+        .iter()
+        .map(|call| call["name"].as_str().expect("call name"))
+        .collect();
+    assert_eq!(
+        owner_calls,
+        ["beforeLocal", "@memcpy", "consume", "afterLocal"]
+    );
+    assert!(
+        !owner_calls.contains(&"@import"),
+        "@import is dependency syntax, not a runtime call"
+    );
+
+    let callback = find_decl(
+        owner["children"].as_array().expect("owner children"),
+        "callback",
+    )
+    .expect("named local callback");
+    let callback_calls: Vec<_> = callback["calls"]
+        .as_array()
+        .expect("callback calls")
+        .iter()
+        .map(|call| call["name"].as_str().expect("call name"))
+        .collect();
+    assert_eq!(callback_calls, ["callbackOnly", "@branchHint"]);
+
+    let anonymous =
+        find_decl(declarations, "anonymous_struct@L44C13").expect("anonymous callback container");
+    assert_eq!(anonymous["kind"], "struct");
+    assert_eq!(
+        find_decl(
+            anonymous["children"]
+                .as_array()
+                .expect("anonymous container children"),
+            "lessThan"
+        )
+        .expect("anonymous callback method")["calls"][0]["name"],
+        "comparatorOnly"
+    );
+
+    let nested_comptime = find_decl(declarations, "comptime@L51C5").expect("nested comptime block");
+    assert_eq!(nested_comptime["calls"][0]["name"], "compileOnly");
+}
+
+#[test]
+fn inner_container_docs_use_inside_placement_without_conflating_outer_docs() {
+    let value = map_json(ADVANCED_FIXTURE);
+    let declarations = file_declarations(&value);
+
+    let documented = find_decl(declarations, "Documented").expect("documented container");
+    assert_eq!(
+        documented["docs"],
+        serde_json::json!(["//! Documentation for the enclosing container."])
+    );
+    assert_eq!(documented["docs_inside"], true);
+
+    let both = find_decl(declarations, "BothDocs").expect("container with both doc positions");
+    assert_eq!(
+        both["docs"],
+        serde_json::json!([
+            "/// Outer documentation wins when the IR cannot preserve both positions."
+        ])
+    );
+    assert_eq!(both["docs_inside"], false);
+}
+
+#[test]
+fn typed_anonymous_containers_preserve_all_nested_fields() {
+    let value = map_json(ADVANCED_FIXTURE);
+    let declarations = file_declarations(&value);
+
+    let typed = find_decl(declarations, "typed_value").expect("typed anonymous struct value");
+    assert_eq!(typed["kind"], "field");
+    let typed_children = typed["children"].as_array().expect("typed struct fields");
+    assert!(find_decl(typed_children, "typed_one").is_some());
+    assert!(find_decl(typed_children, "typed_two").is_some());
+
+    let fulfill = find_decl(declarations, "fulfill").expect("union payload variant");
+    let payload_fields = fulfill["children"]
+        .as_array()
+        .expect("anonymous payload fields");
+    assert!(find_decl(payload_fields, "pending").is_some());
+    assert!(find_decl(payload_fields, "buffer").is_some());
+
+    let shapes = find_decl(declarations, "anonymousShapes").expect("anonymous shape owner");
+    let shape_children = shapes["children"]
+        .as_array()
+        .expect("anonymous shape declarations");
+    for name in ["size", "expected", "value", "pad"] {
+        assert!(
+            find_decl(shape_children, name).is_some(),
+            "anonymous field {name} missing: {shapes}"
+        );
+    }
+    let returned_shape = shape_children
+        .iter()
+        .find(|declaration| {
+            declaration["children"]
+                .as_array()
+                .is_some_and(|children| find_decl(children, "value").is_some())
+        })
+        .expect("returned anonymous struct");
+    assert!(
+        returned_shape.get("attrs").is_none(),
+        "a child field qualifier must not become a container attribute: {returned_shape}"
+    );
+    assert_eq!(
+        find_decl(shape_children, "value").expect("aligned returned field")["attrs"],
+        serde_json::json!(["align(8)"])
+    );
+
+    let cases = find_decl(declarations, "top_level_cases").expect("top-level case table");
+    let case_children = cases["children"].as_array().expect("case table shape");
+    assert!(find_decl(case_children, "name").is_some());
+    assert!(find_decl(case_children, "expected").is_some());
+
+    let nested = find_decl(declarations, "top_level_nested").expect("nested inferred shape");
+    assert!(find_decl(
+        nested["children"].as_array().expect("nested shape children"),
+        "value"
+    )
+    .is_some());
+
+    let combined = find_decl(declarations, "CombinedError").expect("inferred error union");
+    let error_children = combined["children"].as_array().expect("error members");
+    for name in ["Missing", "Invalid", "Other"] {
+        assert!(
+            error_children
+                .iter()
+                .any(|declaration| declaration["name"] == name),
+            "inferred error member {name} must be direct: {combined}"
+        );
+    }
+    assert!(
+        error_children.iter().all(|declaration| {
+            !declaration["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("anonymous_error_set@"))
+        }),
+        "inferred error unions must not gain a synthetic namespace: {combined}"
+    );
 }

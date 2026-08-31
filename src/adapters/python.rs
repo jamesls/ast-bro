@@ -401,7 +401,12 @@ fn _handle_import_statement<'a, D: Doc>(
             "dotted_name" => {
                 let module = String::from_utf8_lossy(&src[child.range()]).to_string();
                 let local = module.split('.').next_back().unwrap_or(&module).to_string();
-                out.push(ImportBinding { local, module, line });
+                out.push(ImportBinding {
+                    local,
+                    module,
+                    member_path: Vec::new(),
+                    line,
+                });
             }
             "aliased_import" => {
                 let name = child.field("name");
@@ -409,7 +414,12 @@ fn _handle_import_statement<'a, D: Doc>(
                 if let (Some(n), Some(a)) = (name, alias) {
                     let module = String::from_utf8_lossy(&src[n.range()]).to_string();
                     let local = String::from_utf8_lossy(&src[a.range()]).to_string();
-                    out.push(ImportBinding { local, module, line });
+                    out.push(ImportBinding {
+                        local,
+                        module,
+                        member_path: Vec::new(),
+                        line,
+                    });
                 }
             }
             _ => {}
@@ -453,6 +463,7 @@ fn _handle_import_from<'a, D: Doc>(
                 out.push(ImportBinding {
                     local: bare,
                     module,
+                    member_path: Vec::new(),
                     line,
                 });
             }
@@ -467,7 +478,12 @@ fn _handle_import_from<'a, D: Doc>(
                         format!("{}.{}", module_prefix, bare)
                     };
                     let local = String::from_utf8_lossy(&src[a.range()]).to_string();
-                    out.push(ImportBinding { local, module, line });
+                    out.push(ImportBinding {
+                        local,
+                        module,
+                        member_path: Vec::new(),
+                        line,
+                    });
                 }
             }
             "wildcard_import" => { /* `from X import *` — no specific local */ }

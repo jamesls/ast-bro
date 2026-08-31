@@ -16,6 +16,10 @@ use crate::calls::cli_helpers::{resolve_target_full, SymbolKind};
 use crate::calls::graph::{CallEdge, CallGraph, CallKindCompat, CallTarget, Confidence, Qn};
 use crate::calls::{render, traverse};
 use crate::graph_cache;
+use crate::symbol_path::{
+    first_qualified_separator, first_unquoted_byte, last_qualified_separator,
+    last_unquoted_any, last_unquoted_byte,
+};
 use crate::UNLIMITED;
 
 #[allow(clippy::too_many_arguments)]
@@ -465,7 +469,10 @@ pub(crate) fn collect_type_callers(calls: &CallGraph, type_qn: &Qn) -> TypeCalle
 }
 
 fn trailing_segment(s: &str) -> String {
-    s.rsplit("::").next().unwrap_or(s).to_string()
+    let s = s.trim();
+    last_unquoted_any(s, b"\\.:")
+        .map_or(s, |index| &s[index + 1..])
+        .to_string()
 }
 
 /// Walk the inheritance chain upward from `type_qn`, returning each
@@ -558,7 +565,7 @@ fn methods_of_type(calls: &CallGraph, type_qn: &Qn) -> Vec<MethodInfo> {
         .keys()
         .filter(|qn| {
             qn.as_str().starts_with(&prefix)
-                && !qn.as_str()[prefix.len()..].contains("::")
+                && first_qualified_separator(&qn.as_str()[prefix.len()..]).is_none()
         })
         .map(|m_qn| {
             let (file, line) = calls
@@ -588,16 +595,16 @@ fn methods_of_type(calls: &CallGraph, type_qn: &Qn) -> Vec<MethodInfo> {
 /// `LanguageAdapter` hash to the same key — mirrors the build-side helper.
 fn normalise_type_name(name: &str) -> String {
     let mut name = name.trim();
-    if let Some(i) = name.find('<') {
+    if let Some(i) = first_unquoted_byte(name, b'<') {
         name = &name[..i];
     }
-    if let Some(i) = name.find('[') {
+    if let Some(i) = first_unquoted_byte(name, b'[') {
         name = &name[..i];
     }
-    if let Some(i) = name.rfind('.') {
+    if let Some(i) = last_unquoted_byte(name, b'.') {
         name = &name[i + 1..];
     }
-    if let Some(i) = name.rfind("::") {
+    if let Some(i) = last_qualified_separator(name) {
         name = &name[i + 2..];
     }
     name.to_string()
@@ -640,3 +647,24 @@ pub fn run_trace(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn methods_of_type_treats_colons_inside_escaped_name_as_content() {
+        let mut calls = CallGraph::empty(PathBuf::from("."));
+        calls.forward.insert(
+            Qn::new(r#"helper.zig::Container::@"method::later""#),
+            Vec::new(),
+        );
+        calls.forward.insert(
+            Qn::new("helper.zig::Container::Nested::method"),
+            Vec::new(),
+        );
+
+        let methods = methods_of_type(&calls, &Qn::new("helper.zig::Container"));
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].qn.name(), r#"@"method::later""#);
+    }
+}

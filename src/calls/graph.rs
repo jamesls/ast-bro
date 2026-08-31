@@ -5,6 +5,7 @@
 //! confidence so consumers can filter out fuzzy matches in CI gates.
 
 use crate::core::{CallKind, JSON_SCHEMA_GRAPH_INDEX};
+use crate::symbol_path::{first_qualified_separator, last_qualified_separator};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,14 +27,14 @@ impl Qn {
     }
     /// Repo-relative file path component (everything before the first `::`).
     pub fn file(&self) -> &str {
-        match self.0.find("::") {
+        match first_qualified_separator(&self.0) {
             Some(i) => &self.0[..i],
             None => &self.0,
         }
     }
     /// Terminal symbol name (everything after the last `::`).
     pub fn name(&self) -> &str {
-        match self.0.rfind("::") {
+        match last_qualified_separator(&self.0) {
             Some(i) => &self.0[i + 2..],
             None => &self.0,
         }
@@ -276,6 +277,16 @@ impl CallGraph {
         }
         self.reverse = rev;
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn qn_segments_ignore_separators_inside_escaped_zig_identifiers() {
+        let qn = Qn::new(r#"src/helper.zig::@"Type::With-Dash"::@"work::later""#);
+        assert_eq!(qn.file(), "src/helper.zig");
+        assert_eq!(qn.name(), r#"@"work::later""#);
+    }
 }

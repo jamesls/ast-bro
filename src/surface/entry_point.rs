@@ -4,7 +4,7 @@
 //!   1. `Cargo.toml` (workspace or single crate)
 //!   2. `pyproject.toml` (Python package)
 //!   3. `__init__.py` directly in the dir (Python package without manifest)
-//!   4. Known fallback manifests such as `build.zig`
+//!   4. `build.zig` or a conventional Zig module root
 //!   5. Fallback: walk the dir and let the per-file visibility filter run.
 //!
 //! When given a file, dispatch by name/extension instead.
@@ -44,6 +44,12 @@ pub enum EntryPoint {
         #[allow(dead_code)]
         pkg_name: String,
     },
+    /// A Zig source module. Zig's public namespace is rooted in one source
+    /// file; public `const` aliases and `usingnamespace` declarations can
+    /// then republish declarations from other files.
+    ZigModule {
+        root_file: PathBuf,
+    },
     /// Visibility-filtered walk for languages without re-exports.
     Fallback {
         paths: Vec<PathBuf>,
@@ -64,6 +70,7 @@ pub fn discover_as(input: &Path, lang: LangOverride) -> Result<EntryPoint, Surfa
         LangOverride::Python => discover_python(input),
         LangOverride::TypeScript => discover_typescript(input),
         LangOverride::Scala => discover_scala(input),
+        LangOverride::Zig => discover_zig(input),
         LangOverride::Fallback => Ok(EntryPoint::Fallback {
             paths: vec![input.to_path_buf()],
         }),
@@ -119,6 +126,11 @@ fn discover_file(file: &Path) -> Result<EntryPoint, SurfaceError> {
             pkg_name: _dir_basename(dir),
         });
     }
+    if ext == "zig" {
+        return Ok(EntryPoint::ZigModule {
+            root_file: file.to_path_buf(),
+        });
+    }
     // Last resort: fallback on this single file.
     Ok(EntryPoint::Fallback {
         paths: vec![file.to_path_buf()],
@@ -141,12 +153,13 @@ fn discover_dir(dir: &Path) -> Result<EntryPoint, SurfaceError> {
     if _has_scala_file(dir) {
         return discover_scala(dir);
     }
-    // Zig / PHP / Ruby / C++ have no `pub use`-style re-export semantics, so
-    // there's no meaningful per-language surface resolver. Recognise their
-    // manifests so we route to Fallback explicitly (and skip the deeper
-    // probe below) rather than missing the dir entirely.
-    if dir.join("build.zig").is_file()
-        || dir.join("composer.json").is_file()
+    if dir.join("build.zig").is_file() || conventional_zig_root(dir).is_some() {
+        return discover_zig(dir);
+    }
+    // PHP / Ruby / C++ have no `pub use`-style re-export semantics. Recognise
+    // their manifests so we route to Fallback explicitly (and skip the
+    // deeper probe below) rather than missing the dir entirely.
+    if dir.join("composer.json").is_file()
         || dir.join("Gemfile").is_file()
         || dir.join("CMakeLists.txt").is_file()
     {
@@ -162,6 +175,43 @@ fn discover_dir(dir: &Path) -> Result<EntryPoint, SurfaceError> {
     Ok(EntryPoint::Fallback {
         paths: vec![dir.to_path_buf()],
     })
+}
+
+fn discover_zig(input: &Path) -> Result<EntryPoint, SurfaceError> {
+    if input.is_file() {
+        if input.extension().and_then(|s| s.to_str()) == Some("zig") {
+            return Ok(EntryPoint::ZigModule {
+                root_file: input.to_path_buf(),
+            });
+        }
+        return Err(SurfaceError::NoEntryPoint {
+            path: input.to_path_buf(),
+            hint: "the requested Zig entry point is not a .zig file".into(),
+        });
+    }
+
+    let root_file = conventional_zig_root(input).or_else(|| {
+        let build = input.join("build.zig");
+        build.is_file().then_some(build)
+    });
+    root_file
+        .map(|root_file| EntryPoint::ZigModule { root_file })
+        .ok_or_else(|| SurfaceError::NoEntryPoint {
+            path: input.to_path_buf(),
+            hint: "no build.zig or conventional src/root.zig, src/lib.zig, or src/main.zig entry point"
+                .into(),
+        })
+}
+
+/// Zig deliberately leaves package topology to `build.zig`. Evaluating an
+/// arbitrary build program is neither safe nor deterministic here, so use
+/// the source roots established by Zig's project templates. If none exists,
+/// callers fall back to the build script itself.
+fn conventional_zig_root(dir: &Path) -> Option<PathBuf> {
+    ["src/root.zig", "src/lib.zig", "src/main.zig"]
+        .into_iter()
+        .map(|relative| dir.join(relative))
+        .find(|candidate| candidate.is_file())
 }
 
 fn _has_index_file(dir: &Path) -> bool {

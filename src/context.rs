@@ -19,6 +19,7 @@ use crate::calls::cli_helpers::{resolve_target_full, ResolvedTarget, SymbolKind}
 use crate::calls::graph::{CallGraph, CallTarget, Confidence};
 use crate::calls::traverse;
 use crate::graph_cache;
+use crate::symbol_path::terminal_qualified;
 
 const BYTES_PER_TOKEN: usize = 4;
 
@@ -733,7 +734,7 @@ fn render_text(report: &ContextReport) -> String {
         out.push_str(&format!(
             "    {} {} ({}:{}, ~{} tokens)\n",
             e.kind.as_deref().unwrap_or("symbol").dimmed(),
-            e.qn.split("::").last().unwrap_or(&e.qn).yellow(),
+            terminal_qualified(&e.qn).yellow(),
             e.file.cyan(),
             e.line.to_string().truecolor(150, 150, 150),
             e.tokens,

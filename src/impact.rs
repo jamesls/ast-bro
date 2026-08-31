@@ -22,6 +22,7 @@ use crate::deps::traverse as dep_traverse;
 use crate::deps::DepGraph;
 use crate::file_filter::is_test_file;
 use crate::graph_cache;
+use crate::symbol_path::{first_qualified_separator, terminal_qualified};
 use crate::UNLIMITED;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -859,7 +860,7 @@ fn render_text(reports: &[ImpactReport], candidate_count: usize) -> String {
             "{} {} {} ({}:{})\n",
             "⊕".bold(),
             r.target_kind.dimmed(),
-            r.target_qn.split("::").last().unwrap_or(&r.target_qn).yellow(),
+            terminal_qualified(&r.target_qn).yellow(),
             colorize_file(&r.target_file),
             colorize_line(r.target_line),
         ));
@@ -938,12 +939,7 @@ fn colorize_confidence(c: &str) -> String {
 }
 
 fn colorize_file_path(qn: &str, file: &str) -> String {
-    let display = if qn.contains("::") {
-        let parts: Vec<&str> = qn.splitn(2, "::").collect();
-        if parts.len() == 2 { parts[0] } else { file }
-    } else {
-        file
-    };
+    let display = first_qualified_separator(qn).map_or(file, |index| &qn[..index]);
     format!(" ({})", display).truecolor(100, 100, 100).to_string()
 }
 
@@ -953,10 +949,7 @@ fn name_or_raw_segment(qn: &str) -> &str {
     if qn.starts_with('[') {
         return qn;
     }
-    match qn.rfind("::") {
-        Some(i) => &qn[i + 2..],
-        None => qn,
-    }
+    terminal_qualified(qn)
 }
 
 pub mod mcp {

@@ -178,14 +178,14 @@ Homonyms such as `helper`, `init`, `parse`, and `validate` create most false mat
 
 For each `RawEdge` whose target is a bare name:
 
-1. Try Zig namespace receiver imports. For `helper.work()`, pass A looks up `helper` as the local import binding, resolves its module spec to a project file, and selects a real top-level `work` declaration from that file with `Confidence::Exact`. The full receiver must equal the binding, so a receiver such as `std.debug` cannot match an import named `std`. This check runs before generic receiver handling because Zig permits imports named `self`, `this`, `crate`, and the other spellings that are keywords or conventions in other languages.
+1. Try Zig import paths. For `helper.work()`, pass A resolves `helper` as an import binding and selects a real file-scope `work` declaration. It also resolves inline calls such as `@import("helper.zig").work()`, declaration scopes such as `module.Type.init()`, and renamed facade chains such as `api.Controller.init()`. An alias can refer to a module, namespace, type, or callable, including a bare call such as `const run = module.run; run()`. The adapter rewrites function-local import calls to their inline `@import` form within the binding's lexical block, so a local name cannot leak into another function. This check runs before generic receiver handling because Zig permits imports named `self`, `this`, `crate`, and the other spellings that are keywords or conventions in other languages.
 2. Try same-file definitions. A receiverless or self-like call can bind locally. Self-like binding prefers the sibling under the caller's scope, so `self.shared()` inside `Greeter::caller` selects `Greeter::shared` instead of another class's `shared`. Zig treats only `self` and `Self` as self-like; `this`, `cls`, `crate`, and `super` remain ordinary explicit receivers. An explicit object receiver such as `connection.getCtx()` blocks bare same-file binding because the target belongs to another object (issue #31).
-   - A type-qualified call such as `Foo::bar()` or `Foo.bar()` can bind `Exact` only when a local qn has the complete `::Foo::bar` scope under the caller.
+   - A type-qualified call such as `Foo::bar()` or `Foo.bar()` can bind `Exact` only when a local qn has the complete `::Foo::bar` scope under the caller. The Zig adapter records simple parameter types and local struct-initializer types, so `widget.ping()` can become the exact `Widget.ping`. A Zig receiver without a concrete import or type remains unresolved instead of binding through a file-level dependency guess.
    - Rust prefixes use anchored scopes. `self::P` starts at the caller's enclosing scope, each `super::` skips one additional level, and `crate::P` anchors at a crate root such as `lib.rs`, `main.rs`, or a `src/bin` target. A miss continues to passes B and C without terminal-name fallback.
    - PHP scoped keywords do not arrive as receivers. The adapter normalizes case-insensitive `self::`, `static::`, and `parent::` forms to `None`. The resolver does not classify bare `static` or `parent` variables as self-like.
 3. Try direct imports. A receiverless or non-shifting self-like call whose callee matches an import binding resolves through the same dependency resolver.
 
-Within the resolved target file, both import paths prefer the exact direct file-scope qn `<target-file>::<name>` before a nested declaration with the same terminal name. For a Zig namespace call, that direct declaration is mandatory: `helper.work()` selects `helper.zig::work`, but it neither selects `helper.zig::SomeType::work` nor invents a missing file-scope qn. Legacy direct-import resolution may still fall back to a nested declaration or a synthesized file-scope qn when an adapter did not emit a matching declaration.
+Within the resolved target file, import paths require an exact qualified name. `helper.work()` selects `helper.zig::work`, while `helper.Type.work()` selects only `helper.zig::Type::work`. Neither form selects a sibling or nested homonym, and the resolver never invents a missing Zig qn. A recognized Zig namespace path that fails partway stays unresolved. Legacy direct-import resolution for other languages may still fall back to a nested declaration or a synthesized file-scope qn when an adapter did not emit a matching declaration.
 
 ### Pass B symbol table
 
@@ -235,7 +235,7 @@ Every source-code language adapter emits `Declaration::calls`. The SQL and Markd
 | Go         | `call_expression` | none (`new(T)` is just a regular call) | `selector_expression` for receivers |
 | PHP        | `function_call_expression`, `member_call_expression`, `nullsafe_member_call_expression`, `scoped_call_expression`, `object_creation_expression` | `new T()` (last `\` segment of qualified type) | `\Foo\bar()` namespace-prefixed free function drops the namespace and emits the bare name with `receiver: None` so pass B promotes it; `self::` / `static::` / `parent::` keywords drop receiver (case-folded by tree-sitter-php's `keyword()` helper); dynamic `$func()` and `new $cls()` return `None` |
 | Ruby       | `call` (with `method` / `receiver` fields) | `Foo.new` (constant receiver) | tree-sitter-ruby 0.23.1 represents `obj.method()`, `obj.method "x"`, `puts "hello"`, and `Greeter.shout` as `call`. The walker enters `block` and `do_block` because these closures use the enclosing method's scope. |
-| Zig        | `call_expression`, `struct_initializer` | typed struct literal | preserves raw `field_expression` receiver text; skips `builtin_function`; each `test` declaration owns its calls |
+| Zig        | `call_expression`, `builtin_function`, `struct_initializer` | typed struct literal | preserves raw `field_expression` receiver text; records compiler builtins except dependency-only `@import`; functions, tests, `comptime` blocks, and local container methods own their direct calls |
 | SQL        | n/a | n/a | intentionally emits no calls |
 | Markdown   | n/a | n/a | intentionally emits no calls |
 
@@ -250,7 +250,7 @@ Every source-code language adapter emits `Declaration::calls`. The SQL and Markd
 
 ## Unified graph cache
 
-The call graph shares `.ast-bro/deps/graph.bin` with the dependency graph as `UnifiedGraph { deps, calls: Option<CallGraph> }`. The schema constant is `JSON_SCHEMA_GRAPH_INDEX = "ast-bro.graph-index.v2"`. The directory keeps its `deps/` name because changing the path would force a separate rebuild.
+The call graph shares `.ast-bro/deps/graph.bin` with the dependency graph as `UnifiedGraph { deps, calls: Option<CallGraph> }`. The schema constant is `JSON_SCHEMA_GRAPH_INDEX = "ast-bro.graph-index.v3"`. The directory keeps its `deps/` name because changing the path would force a separate rebuild.
 
 ### Disk layout
 
@@ -285,9 +285,13 @@ happens, the process exits.
 
 ### Schema migration
 
-The legacy `deps-index.v1` cache was retired in v2.1.0, while the path remained `.ast-bro/deps/graph.bin`. The current schema is `ast-bro.graph-index.v2`. `cache::load_with_delta` compares the stored string with this value. A `graph-index.v1` mismatch returns `LoadOutcome::Missing`, and `load_or_build` rebuilds the cache in place.
+The legacy `deps-index.v1` cache was retired in v2.1.0, while the path remained `.ast-bro/deps/graph.bin`. The current schema is `ast-bro.graph-index.v3`. `cache::load_with_delta` compares the stored string with this value. Older schema values return `LoadOutcome::Missing`, and `load_or_build` rebuilds the cache in place.
 
 Version 2 also fixes a bincode round-trip bug. `#[serde(skip_serializing_if)]` on `DepEdge::local_name`, `DepEdge::raw_path`, `CallEdge::receiver`, and `CallEdge::candidates` omitted positional fields and shifted the bytes that followed. Removing those annotations and rejecting v1 ensures the next graph query writes a complete cache.
+
+Version 3 invalidates call graphs produced before the complete Zig adapter and
+namespace resolver. Without the bump, an unchanged Zig checkout could keep
+missing declarations and edges even after upgrading the binary.
 
 ### Per-file invalidation
 
@@ -314,7 +318,7 @@ Version 2 also fixes a bincode round-trip bug. `#[serde(skip_serializing_if)]` o
 4. Splice new qns into the live indices before resolving. Passes A and B must see qns added by the same delta.
 5. Resolve only the new passes via `resolve::run_with_table` (the split-out resolver entrypoint that takes a prebuilt symbol table instead of constructing one).
 6. Validate every `Resolved` edge against the updated qn set. If a target qn was deleted or renamed, demote its edge to `Bare` while preserving the callee name. An unchanged target keeps its `Exact` confidence, even when another declaration in the file changed.
-7. After a Zig file changes, re-extract each unchanged Zig caller file that has receiver-bearing edges and run the complete resolver on it. Namespace-import resolution needs the caller's import bindings, which the persisted `CallGraph` does not store. This refresh preserves cold-build behavior when an imported callable appears, disappears, or changes shape.
+7. After any source file changes, re-extract every unchanged Zig caller file and run the complete resolver on it. The persisted `CallGraph` does not contain import bindings, and a non-Zig edit can add a homonymous callable. The resolver also reparses unchanged intermediate Zig facades for their top-level aliases. This refresh preserves cold-build behavior for receiver namespaces, bare callable aliases, and rejected homonyms.
 8. Re-resolve every remaining `Bare` edge against the updated symbol table. A receiverless single match promotes to `Resolved/Exact`, matching pass B. Other edges use the same `resolve::disambiguate` function as pass C, with a memoised dependency closure per file. This step finds targets moved to another file and targets added for bare edges in unchanged files.
 
    A partial update must produce the same graph as a cold build of the same content. The previous updater assigned each edge the unfiltered symbol-table candidates. On ast-bro, appending a comment to `src/adapters/sql.rs` increased `callers CliError.new` from 1,023 unresolved sites to 1,073 because every `Vec::new()` gained a candidate that the dependency filter had rejected. Reusing pass C prevents that divergence. `tests/calls_e2e.rs::incremental_update_matches_a_cold_build_of_the_same_content` checks this invariant.
@@ -341,7 +345,7 @@ Same pattern as the search index: `fs2` advisory exclusive lock at `.ast-bro/dep
 
 ## Known gaps
 
-- The suffix index gets a fresh full walk on every delta. The walk is the cheap part of a cold build (~hundreds of ms even on big repos). Changed files are the only files re-extracted by default. After a Zig delta, the call patcher also re-extracts unchanged Zig files with receiver-bearing edges so namespace imports match a cold build. A surgical suffix-index update would be more code than it saves.
+- The suffix index gets a fresh full walk on every delta. The walk is the cheap part of a cold build (hundreds of milliseconds even on large repositories). Changed files are the only files re-extracted by default. When the call graph exists, the patcher also re-extracts unchanged Zig callable files so import and callable aliases match a cold build. A surgical suffix-index update would add more complexity than it saves.
 
 ## Adding a new language
 

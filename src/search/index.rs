@@ -14,10 +14,10 @@
 //! find-related:  resolve chunk → semantic top-k (lang-filtered) → exclude self → top-k
 //! ```
 //!
-//! Schema v2 adds `indexed_corpus` to `meta.json` so search/find_related can
+//! Schema v2 added `indexed_corpus` to `meta.json` so search/find_related can
 //! filter results by query scope without conflating it with index location.
-//! v1 metas are read transparently as having `indexed_corpus = ""` (whole
-//! home).
+//! Schema v3 invalidates cached Zig chunks after their strategy changed from
+//! blank-line text to declaration-aware structural chunking.
 //!
 //! A non-empty delta (added / modified / removed) is applied incrementally by
 //! `apply_delta`: the changed files' old chunks are tombstoned, the added /
@@ -31,7 +31,9 @@ use crate::file_filter::{add_filters, should_skip_path};
 use crate::project_root::{relative_posix, resolve_home, Marker};
 use crate::search::bm25::Bm25Index;
 use crate::search::cache::{compute_delta, hash_file, FileRecord, MAX_INDEX_FILE_BYTES};
-use crate::search::chunker::{chunk_file, is_indexable, Chunk, ChunkKind};
+use crate::search::chunker::{
+    chunk_file, compare_chunk_ids, is_indexable, Chunk, ChunkKind,
+};
 use crate::search::download::{ensure_model, ModelInfo};
 use crate::search::embed::{cosine_topk, Embedder, DIM};
 use crate::search::fusion::{combine, resolve_alpha, rrf_scores};
@@ -103,10 +105,10 @@ fn apply_file_prior(
 const MIN_CANDIDATES: usize = 100;
 
 /// Current schema version written by all new builds.
-// v2 adds `breadcrumb` and `kind` to `Chunk`, which changes the bincode layout
-// of chunks.bin. A v1 index cannot be decoded, so the loader rejects it and the
-// caller rebuilds.
-const SCHEMA: &str = "ast-bro.search-index.v2";
+// v2 added `breadcrumb` and `kind` to `Chunk`, which changed the bincode layout
+// of chunks.bin. v3 keeps that layout but changes Zig chunk semantics, so old
+// indexes still need a rebuild.
+const SCHEMA: &str = "ast-bro.search-index.v3";
 
 /// On-disk paths under a repo's `.ast-bro/index/` directory.
 #[derive(Debug, Clone)]
@@ -168,10 +170,10 @@ pub struct Meta {
     pub model: ModelMeta,
     pub created_unix: u64,
     pub chunk_count: u32,
-    /// Always `"f32_le"` for v1/v2. Reserved so a future schema can switch
+    /// Always `"f32_le"` for v1-v3. Reserved so a future schema can switch
     /// to f16/quantized.
     pub embedding_dtype: String,
-    /// Reserved for incremental updates — empty in v1/v2.
+    /// Reserved for incremental updates — empty in v1-v3.
     #[serde(default)]
     pub tombstones: Vec<u32>,
     /// Subdirectory of `paths.root` that this index covers, as a POSIX path
@@ -244,8 +246,8 @@ pub struct Index {
 }
 
 /// Compaction kicks in when tombstones occupy more than this fraction of
-/// total chunk slots — a full rebuild reclaims the space and resets BM25
-/// IDF skew. Override at build time with `AST_BRO_COMPACTION_RATIO` (or
+/// total chunk slots — a full rebuild reclaims the dead chunk and embedding
+/// slots. Override at build time with `AST_BRO_COMPACTION_RATIO` (or
 /// legacy `AST_OUTLINE_COMPACTION_RATIO`).
 const DEFAULT_COMPACTION_RATIO: f32 = 0.30;
 
@@ -374,7 +376,7 @@ impl Index {
         // 2. Build flat chunks vec + per-file chunk_range.
         let mut chunks = Vec::new();
         let mut files: Vec<FileRecord> = Vec::with_capacity(file_paths.len());
-        for (path, file_chunks) in file_paths.iter().zip(chunks_per_file.into_iter()) {
+        for (path, file_chunks) in file_paths.iter().zip(chunks_per_file) {
             let rel = match path.strip_prefix(&paths.root) {
                 Ok(r) => normalise_path(r),
                 Err(_) => continue,
@@ -605,9 +607,9 @@ impl Index {
         self.live_mask = build_live_mask(self.chunks.len(), &self.meta.tombstones);
 
         // --- 4. Rebuild BM25 from live chunks. Tombstoned slots produce
-        //         empty doc-tokens so they don't contribute terms; the
-        //         empty docs still occupy doc-ids 1:1 with `chunks`,
-        //         keeping `get_scores` slot-aligned. ---
+        //         empty doc-tokens and are excluded from N/avgdl, while still
+        //         occupying doc ids 1:1 with `chunks` so `get_scores` stays
+        //         slot-aligned. ---
         let live_mask_view = self.live_mask.as_deref();
         let bm25_docs: Vec<Vec<String>> = self
             .chunks
@@ -621,7 +623,10 @@ impl Index {
                 }
             })
             .collect();
-        self.bm25 = Bm25Index::build(bm25_docs);
+        self.bm25 = match live_mask_view {
+            Some(mask) => Bm25Index::build_with_live_mask(bm25_docs, mask),
+            None => Bm25Index::build(bm25_docs),
+        };
 
         // --- 5. Persist atomically (best-effort: each file via write_atomic;
         //         meta.json is renamed last so partial-write recovery on
@@ -645,9 +650,9 @@ impl Index {
     /// Load from disk without delta-checking. Used by `open` and tests.
     fn load_unlocked(paths: &IndexPaths) -> io::Result<Self> {
         let meta: Meta = read_meta(&paths.meta_json)?;
-        // Only the current schema decodes. Earlier ones — including the
-        // pre-rename `ast-outline.*` names — predate the `Chunk` layout change
-        // in v2, so the caller has to rebuild rather than read them.
+        // Only the current schema loads. Earlier ones either predate the
+        // `Chunk` layout change in v2 or contain pre-structural Zig chunks, so
+        // the caller has to rebuild rather than read them.
         if meta.schema != SCHEMA {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -773,12 +778,18 @@ impl Index {
             return HashMap::new();
         }
 
-        let sem = cosine_topk(q_embed, &self.embeddings, Some(&outline_mask), PHASE1_FILES);
+        let sem = cosine_topk_for_chunks(
+            q_embed,
+            &self.embeddings,
+            Some(&outline_mask),
+            PHASE1_FILES,
+            &self.chunks,
+        );
         let lex = if query_tokens.is_empty() {
             Vec::new()
         } else {
             let raw = self.bm25.get_scores(query_tokens, Some(&outline_mask));
-            top_k_indices(&raw, PHASE1_FILES)
+            top_k_indices(&raw, PHASE1_FILES, &self.chunks)
         };
         let fused = combine(&rrf_scores(&sem), &rrf_scores(&lex), 0.5);
 
@@ -839,11 +850,12 @@ impl Index {
 
         // Semantic top-N.
         let q_embed = self.embedder.encode_one(query);
-        let semantic_scored = cosine_topk(
+        let semantic_scored = cosine_topk_for_chunks(
             &q_embed,
             &self.embeddings,
             mask.as_deref(),
             candidate_count,
+            &self.chunks,
         );
 
         // BM25 top-N.
@@ -852,7 +864,7 @@ impl Index {
             Vec::new()
         } else {
             let raw = self.bm25.get_scores(&query_tokens, mask.as_deref());
-            top_k_indices(&raw, candidate_count)
+            top_k_indices(&raw, candidate_count, &self.chunks)
         };
 
         // RRF + alpha combine.
@@ -865,7 +877,7 @@ impl Index {
         boost_multi_chunk_files(&mut scored, &self.chunks);
         let prior = self.file_prior(&q_embed, &query_tokens, mask.as_deref());
         apply_file_prior(&mut scored, &self.chunks, &prior, FILE_PRIOR_WEIGHT);
-        let scored = apply_query_boost(scored, query, &self.chunks);
+        let scored = apply_query_boost(scored, query, &self.chunks, mask.as_deref());
 
         // Final top-k with path penalties + saturation decay.
         let ranked = rerank_topk(&scored, &self.chunks, opts.top_k, /* penalise_paths */ true);
@@ -918,7 +930,7 @@ impl Index {
         dep_depth: usize,
         query_scope: Option<&str>,
     ) -> Option<Vec<SearchHit>> {
-        let source_id = resolve_chunk(&self.chunks, file_path, line)?;
+        let source_id = resolve_chunk(&self.chunks, file_path, line, self.live_mask.as_deref())?;
         let source = &self.chunks[source_id as usize];
 
         // Build language-restricted + self-excluding (+ scope-filtered + live) mask.
@@ -935,7 +947,13 @@ impl Index {
         // promote items that wouldn't be in the top-k by raw similarity.
         let candidate_k = if dep_boost { top_k * 5 } else { top_k };
         let q_embed = self.embedder.encode_one(&source.content);
-        let mut scored = cosine_topk(&q_embed, &self.embeddings, Some(&mask), candidate_k);
+        let mut scored = cosine_topk_for_chunks(
+            &q_embed,
+            &self.embeddings,
+            Some(&mask),
+            candidate_k,
+            &self.chunks,
+        );
 
         if dep_boost {
             if let Some(graph) = self.dep_graph_cached() {
@@ -956,7 +974,11 @@ impl Index {
                             };
                         }
                     }
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.sort_by(|a, b| {
+                        b.1.total_cmp(&a.1)
+                            .then_with(|| compare_chunk_ids(&self.chunks, a.0, b.0))
+                            .then(a.0.cmp(&b.0))
+                    });
                     scored.truncate(top_k);
                 }
             }
@@ -1088,26 +1110,41 @@ fn corpus_walk_dir(home: &Path, corpus: &str) -> PathBuf {
     }
 }
 
+/// Return the dense top-k with logical chunk identity as the score tiebreak.
+fn cosine_topk_for_chunks(
+    query: &[f32; DIM],
+    embeddings: &[f32],
+    mask: Option<&[bool]>,
+    k: usize,
+    chunks: &[Chunk],
+) -> Vec<(u32, f32)> {
+    debug_assert_eq!(embeddings.len() / DIM, chunks.len());
+    cosine_topk(query, embeddings, mask, k, |left, right| {
+        compare_chunk_ids(chunks, *left, *right)
+    })
+}
+
 /// Convert a dense scores vector into the top-k `(id, score)` pairs (descending).
 /// Used for BM25 (which returns one score per chunk).
-fn top_k_indices(scores: &[f32], k: usize) -> Vec<(u32, f32)> {
+fn top_k_indices(scores: &[f32], k: usize, chunks: &[Chunk]) -> Vec<(u32, f32)> {
     if scores.is_empty() || k == 0 {
         return Vec::new();
     }
+    debug_assert_eq!(scores.len(), chunks.len());
     let take = k.min(scores.len());
     let mut idx: Vec<u32> = (0..scores.len() as u32).collect();
     idx.select_nth_unstable_by(take - 1, |&a, &b| {
         scores[b as usize]
-            .partial_cmp(&scores[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&scores[a as usize])
+            .then_with(|| compare_chunk_ids(chunks, a, b))
+            .then(a.cmp(&b))
     });
     let mut top: Vec<u32> = idx.into_iter().take(take).collect();
-    // Tie-break on id so the candidate list is a total order, not merely a
-    // deterministic one — see the note in `rerank_topk`.
+    // Tie-break on persistent identity so warm and compact indexes agree.
     top.sort_by(|&a, &b| {
         scores[b as usize]
-            .partial_cmp(&scores[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&scores[a as usize])
+            .then_with(|| compare_chunk_ids(chunks, a, b))
             .then(a.cmp(&b))
     });
     // Drop zero-score entries — BM25 zeros mean "no query token matched".
@@ -1118,21 +1155,38 @@ fn top_k_indices(scores: &[f32], k: usize) -> Vec<(u32, f32)> {
 }
 
 /// Find the chunk that best contains `file_path:line`.
-fn resolve_chunk(chunks: &[Chunk], file_path: &str, line: u32) -> Option<u32> {
+fn resolve_chunk(
+    chunks: &[Chunk],
+    file_path: &str,
+    line: u32,
+    live_mask: Option<&[bool]>,
+) -> Option<u32> {
     let normalised = file_path.replace('\\', "/");
+    debug_assert!(live_mask.is_none_or(|mask| mask.len() == chunks.len()));
+    let mut containing: Option<u32> = None;
     let mut fallback: Option<u32> = None;
     for (i, c) in chunks.iter().enumerate() {
-        if c.file_path != normalised {
+        if live_mask.is_some_and(|mask| !mask[i]) || c.file_path != normalised {
             continue;
         }
-        if c.start_line <= line && line < c.end_line {
-            return Some(i as u32);
+        let id = i as u32;
+        if c.start_line <= line
+            && line < c.end_line
+            && containing.is_none_or(|previous| {
+                compare_chunk_ids(chunks, id, previous).is_lt()
+            })
+        {
+            containing = Some(id);
         }
-        if line == c.end_line {
-            fallback = Some(i as u32);
+        if line == c.end_line
+            && fallback.is_none_or(|previous| {
+                compare_chunk_ids(chunks, id, previous).is_lt()
+            })
+        {
+            fallback = Some(id);
         }
     }
-    fallback
+    containing.or(fallback)
 }
 
 /// Above this, a chunk is indexed lexically but not embedded.
@@ -1444,25 +1498,138 @@ mod tests {
             kind: ChunkKind::Source,
         };
         let chunks = vec![mk(1, 10), mk(20, 30), mk(40, 50)];
-        assert_eq!(resolve_chunk(&chunks, "f.rs", 5), Some(0));
-        assert_eq!(resolve_chunk(&chunks, "f.rs", 25), Some(1));
-        assert_eq!(resolve_chunk(&chunks, "f.rs", 9), Some(0));
+        assert_eq!(resolve_chunk(&chunks, "f.rs", 5, None), Some(0));
+        assert_eq!(resolve_chunk(&chunks, "f.rs", 25, None), Some(1));
+        assert_eq!(resolve_chunk(&chunks, "f.rs", 9, None), Some(0));
         // line == end_line: fallback path.
-        assert_eq!(resolve_chunk(&chunks, "f.rs", 50), Some(2));
+        assert_eq!(resolve_chunk(&chunks, "f.rs", 50, None), Some(2));
         // No matching file.
-        assert_eq!(resolve_chunk(&chunks, "other.rs", 5), None);
+        assert_eq!(resolve_chunk(&chunks, "other.rs", 5, None), None);
         // Out-of-range line.
-        assert_eq!(resolve_chunk(&chunks, "f.rs", 60), None);
+        assert_eq!(resolve_chunk(&chunks, "f.rs", 60, None), None);
     }
 
     #[test]
     fn top_k_indices_orders_and_drops_zeros() {
         let scores = vec![0.0, 0.5, 0.0, 0.9, 0.1];
-        let top = top_k_indices(&scores, 5);
+        let chunks: Vec<Chunk> = (0..scores.len())
+            .map(|id| Chunk {
+                content: format!("chunk {id}"),
+                file_path: format!("{id}.rs"),
+                start_line: 1,
+                end_line: 1,
+                start_byte: 0,
+                end_byte: 0,
+                language: "rust".to_string(),
+                breadcrumb: String::new(),
+                kind: ChunkKind::Source,
+            })
+            .collect();
+        let top = top_k_indices(&scores, 5, &chunks);
         assert_eq!(top.len(), 3); // zeros dropped
         assert_eq!(top[0].0, 3);
         assert_eq!(top[1].0, 1);
         assert_eq!(top[2].0, 4);
+    }
+
+    fn ranking_fixture_chunk(file_path: &str, start_byte: u32, content: &str) -> Chunk {
+        Chunk {
+            content: content.to_string(),
+            file_path: file_path.to_string(),
+            start_line: start_byte + 1,
+            end_line: start_byte + 2,
+            start_byte,
+            end_byte: start_byte + content.len() as u32,
+            language: "zig".to_string(),
+            breadcrumb: content.to_string(),
+            kind: ChunkKind::Source,
+        }
+    }
+
+    fn tied_embeddings(chunk_count: usize) -> Vec<f32> {
+        let mut embeddings = vec![0.0; chunk_count * DIM];
+        for row in embeddings.chunks_exact_mut(DIM) {
+            row[0] = 1.0;
+        }
+        embeddings
+    }
+
+    fn rank_fixture(chunks: &[Chunk], live_mask: &[bool]) -> Vec<(String, u32)> {
+        let mut query = [0.0; DIM];
+        query[0] = 1.0;
+        let embeddings = tied_embeddings(chunks.len());
+        let semantic = cosine_topk_for_chunks(
+            &query,
+            &embeddings,
+            Some(live_mask),
+            4,
+            chunks,
+        );
+        let lexical_scores: Vec<f32> = live_mask
+            .iter()
+            .map(|live| if *live { 1.0 } else { 0.0 })
+            .collect();
+        let lexical = top_k_indices(&lexical_scores, 4, chunks);
+        let mut scored = combine(&rrf_scores(&semantic), &rrf_scores(&lexical), 0.5);
+        boost_multi_chunk_files(&mut scored, chunks);
+        let scored = apply_query_boost(
+            scored,
+            "how behavior works",
+            chunks,
+            Some(live_mask),
+        );
+        rerank_topk(&scored, chunks, 4, false)
+            .into_iter()
+            .map(|(id, score)| {
+                let chunk = &chunks[id as usize];
+                (
+                    format!("{}:{}:{}", chunk.file_path, chunk.start_byte, chunk.content),
+                    score.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    /// A warm delta and its compact rebuild must return bit-identical results.
+    ///
+    /// All live dense and lexical scores deliberately tie at the candidate
+    /// cutoff. The warm layout retains an old `b.zig` row between untouched
+    /// files and appends its replacements, while the compact layout restores
+    /// file order. This exercises dense selection, BM25 selection, RRF ranks,
+    /// file-coherence accumulation, and final reranking together.
+    #[test]
+    fn warm_and_compact_layouts_have_identical_logical_ranking() {
+        let a_one = ranking_fixture_chunk("a.zig", 0, "a_one");
+        let a_two = ranking_fixture_chunk("a.zig", 20, "a_two");
+        let b_one = ranking_fixture_chunk("b.zig", 0, "b_one");
+        let b_two = ranking_fixture_chunk("b.zig", 20, "b_two");
+        let c_one = ranking_fixture_chunk("c.zig", 0, "c_one");
+        let dead_b = ranking_fixture_chunk("b.zig", 0, "old_b");
+
+        let compact = vec![
+            a_one.clone(),
+            a_two.clone(),
+            b_one.clone(),
+            b_two.clone(),
+            c_one.clone(),
+        ];
+        let warm = vec![a_one, a_two, dead_b, c_one, b_one, b_two];
+
+        let compact_result = rank_fixture(&compact, &[true, true, true, true, true]);
+        let warm_result = rank_fixture(&warm, &[true, true, false, true, true, true]);
+        assert_eq!(warm_result, compact_result);
+    }
+
+    #[test]
+    fn resolve_chunk_ignores_tombstoned_source_rows() {
+        let chunks = vec![
+            ranking_fixture_chunk("main.zig", 0, "old body"),
+            ranking_fixture_chunk("main.zig", 0, "new body"),
+        ];
+        assert_eq!(
+            resolve_chunk(&chunks, "main.zig", 1, Some(&[false, true])),
+            Some(1)
+        );
     }
 
     /// Smoke test of the persistence round-trip without touching the embedder.

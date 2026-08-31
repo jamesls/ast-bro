@@ -138,6 +138,227 @@ fn build_zig_root_wins_over_nested_cargo_manifest() {
 }
 
 #[test]
+fn zig_surface_follows_namespace_facade_and_usingnamespace_aliases() {
+    let tmp = tempfile::tempdir().expect("create temp directory");
+    write(
+        &tmp.path().join("build.zig"),
+        "pub fn buildOnly() void {}\n",
+    );
+    write(
+        &tmp.path().join("src/main.zig"),
+        r#"pub const direct = @import("direct.zig");
+const facade = @import("facade.zig");
+const facade_again = facade;
+pub const Renamed = facade_again.layer.Source;
+pub const FacadeInjected = facade_again.Injected;
+pub const InlineRenamed = @import("deep.zig").Source;
+pub const ParentNormalized = @import("nested/bridge.zig").Source;
+pub const ThisSource = struct {
+    pub fn fromThis() void {}
+};
+pub const ThisAlias = @This().ThisSource;
+pub const cycle = @import("cycle_peer.zig");
+pub usingnamespace @import("mixin.zig");
+pub const Collision = struct {
+    pub fn local() void {}
+};
+const PrivateCollision = struct {
+    pub fn privateLocal() void {}
+};
+
+pub usingnamespace Later;
+const Later = struct {
+    pub fn laterFn() void {}
+};
+usingnamespace PrivateLater;
+const PrivateLater = struct {
+    pub fn privateMixed() void {}
+};
+
+const Local = struct {
+    pub fn localFn() void {}
+    fn hiddenLocal() void {}
+};
+pub usingnamespace Local;
+
+pub const Plain = struct {
+    value: u8,
+    pub fn own() void {}
+    fn hiddenMethod() void {}
+};
+pub fn stable() void {}
+fn hiddenRoot() void {}
+"#,
+    );
+    write(
+        &tmp.path().join("src/direct.zig"),
+        r#"pub fn run() void {}
+fn hiddenDirect() void {}
+pub const Nested = struct {
+    pub fn ping() void {}
+};
+"#,
+    );
+    write(
+        &tmp.path().join("src/facade.zig"),
+        "pub const layer = @import(\"layer.zig\");\npub usingnamespace @import(\"facade_mixin.zig\");\n",
+    );
+    write(
+        &tmp.path().join("src/facade_mixin.zig"),
+        r#"pub const Injected = struct {
+    pub fn fromFacadeMixin() void {}
+};
+"#,
+    );
+    write(
+        &tmp.path().join("src/cycle_peer.zig"),
+        r#"pub const back = @import("main.zig");
+pub fn leaf() void {}
+"#,
+    );
+    write(
+        &tmp.path().join("src/layer.zig"),
+        "const deep = @import(\"deep.zig\");\npub const Source = deep.Source;\n",
+    );
+    write(
+        &tmp.path().join("src/deep.zig"),
+        r#"pub const Source = struct {
+    pub fn create() Source { return .{}; }
+    fn secret() void {}
+};
+"#,
+    );
+    write(
+        &tmp.path().join("src/nested/bridge.zig"),
+        "pub const Source = @import(\"../deep.zig\").Source;\n",
+    );
+    write(
+        &tmp.path().join("src/mixin.zig"),
+        r#"pub fn mixed() void {}
+pub const MixedType = struct {
+    pub fn fromMixin() void {}
+};
+pub const Collision = struct {
+    pub fn imported() void {}
+};
+pub const PrivateCollision = struct {
+    pub fn importedPublic() void {}
+};
+fn hiddenMixed() void {}
+"#,
+    );
+
+    let root = tmp.path().to_str().expect("UTF-8 temp path");
+    let output = surface(&["surface", root, "--lang", "zig"]);
+
+    for expected in [
+        "direct.run",
+        "direct.Nested.ping",
+        "Renamed.create",
+        "FacadeInjected.fromFacadeMixin",
+        "InlineRenamed.create",
+        "ParentNormalized.create",
+        "ThisAlias.fromThis",
+        "cycle.back.stable",
+        "cycle.leaf",
+        "mixed",
+        "PrivateCollision.importedPublic",
+        "laterFn",
+        "localFn",
+        "Plain.value",
+        "Plain.own",
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing Zig surface entry {expected}:\n{output}"
+        );
+    }
+    for hidden in [
+        "buildOnly",
+        "facade_again",
+        "hiddenDirect",
+        "hiddenLocal",
+        "hiddenMethod",
+        "hiddenRoot",
+        "hiddenMixed",
+        "PrivateCollision.privateLocal",
+        "privateMixed",
+        "cycle.back.cycle.leaf",
+        "Renamed.Source",
+    ] {
+        assert!(
+            !output.contains(hidden),
+            "private or unrenamed Zig entry leaked ({hidden}):\n{output}"
+        );
+    }
+    assert!(
+        output.contains("[via *]"),
+        "usingnamespace entries need a glob marker:\n{output}"
+    );
+    let with_private = surface(&[
+        "surface",
+        &tmp.path().join("src/main.zig").to_string_lossy(),
+        "--include-private",
+    ]);
+    assert!(
+        with_private.contains("privateMixed"),
+        "--include-private should retain private usingnamespace composition:\n{with_private}"
+    );
+
+    let json = surface(&[
+        "surface",
+        &tmp.path().join("src/main.zig").to_string_lossy(),
+        "--json",
+        "--compact",
+    ]);
+    let document: serde_json::Value = serde_json::from_str(&json).expect("valid surface JSON");
+    let entries = document["entries"].as_array().expect("surface entries");
+    assert!(
+        !entries.iter().any(|entry| {
+            entry["qualified_path"] == "Collision"
+                || entry["qualified_path"]
+                    .as_str()
+                    .is_some_and(|path| path.starts_with("Collision."))
+        }),
+        "ambiguous direct/usingnamespace names must be omitted: {document}"
+    );
+    let renamed = entries
+        .iter()
+        .find(|entry| entry["qualified_path"] == "Renamed")
+        .expect("renamed facade entry");
+    assert_eq!(renamed["source_name"], "Source");
+    assert!(
+        renamed["source_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("src/deep.zig")),
+        "facade alias should point to its defining declaration: {renamed}"
+    );
+    assert!(
+        renamed["re_export_chain"]
+            .as_array()
+            .is_some_and(|chain| chain.len() >= 4),
+        "facade provenance chain is incomplete: {renamed}"
+    );
+    let normalized = entries
+        .iter()
+        .find(|entry| entry["qualified_path"] == "ParentNormalized")
+        .expect("parent-relative facade entry");
+    let normalized_source = normalized["source_path"]
+        .as_str()
+        .expect("source path string");
+    assert!(normalized_source.ends_with("src/deep.zig"));
+    assert!(
+        !normalized_source.contains("/../"),
+        "resolved Zig source paths should be normalized: {normalized_source}"
+    );
+    let mixed = entries
+        .iter()
+        .find(|entry| entry["qualified_path"] == "mixed")
+        .expect("usingnamespace entry");
+    assert_eq!(mixed["via_glob"], true);
+}
+
+#[test]
 fn json_schema_present() {
     let s = surface(&[
         "surface",
@@ -238,7 +459,8 @@ fn unknown_lang_errors_cleanly() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stdout.is_empty(), "stdout must be empty:\n{stdout}");
     assert!(
-        stderr.contains("unknown --lang") && stderr.contains("rust|python|fallback"),
+        stderr.contains("unknown --lang")
+            && stderr.contains("rust|python|typescript|scala|zig|fallback"),
         "expected error + expected-values hint on stderr:\n{stderr}"
     );
 }

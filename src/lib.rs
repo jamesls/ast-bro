@@ -25,6 +25,7 @@ mod search;
 mod show;
 mod squeeze;
 mod surface;
+mod symbol_path;
 
 use crate::core::{DigestOptions, MapOptions, ParseResult};
 
@@ -235,7 +236,7 @@ enum Commands {
         #[arg(long)]
         compact: bool,
     },
-    /// True public API surface — resolves `pub use` / `__all__` re-exports.
+    /// True public API surface — resolves language-specific re-exports.
     Surface {
         /// Crate root file, package init, or directory to auto-detect.
         #[arg(default_value = crate::defaults::ROOT)]
@@ -249,10 +250,10 @@ enum Commands {
         /// Recursion guard for re-export chains.
         #[arg(long, default_value_t = crate::defaults::SURFACE_MAX_DEPTH)]
         max_depth: usize,
-        /// Include private items (only meaningful for fallback languages).
+        /// Include private items (meaningful for Zig and fallback languages).
         #[arg(long)]
         include_private: bool,
-        /// Force a specific resolver: `rust`, `python`, or `fallback`.
+        /// Force a resolver: rust, python, typescript, scala, zig, or fallback.
         #[arg(long)]
         lang: Option<String>,
         /// Emit output as JSON instead of text.
@@ -1693,7 +1694,7 @@ pub fn run() {
                             crate::cli_error::ErrorKind::BadArgument,
                             format!("unknown --lang value '{}'", s),
                         )
-                        .hint("Expected rust|python|fallback.")
+                        .hint("Expected rust|python|typescript|scala|zig|fallback.")
                         .exit(*json);
                     }
                 },

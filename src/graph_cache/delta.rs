@@ -28,6 +28,9 @@ use crate::calls::pass::{file_rel, FilePass};
 use crate::calls::resolve;
 use crate::deps::extract::extract;
 use crate::deps::graph::{self as dep_graph, DepEdge};
+use crate::symbol_path::{
+    first_unquoted_byte, last_qualified_separator, last_unquoted_byte,
+};
 use crate::deps::manifest::detect_aliases;
 use crate::deps::resolver::{build_suffix_index, resolve as resolve_spec, ResolveCtx};
 use crate::deps::{DepError, DepGraph};
@@ -250,53 +253,45 @@ pub fn apply_delta_to_calls(
         }
     }
 
-    // 9. Re-run the complete resolver for unchanged Zig files with receiver
-    //    calls after a Zig delta. Namespace-import pass A depends on the
-    //    caller's ImportBindings, which are not stored in CallGraph; the
-    //    generic bare-name repair below cannot reconstruct that information.
-    //    Re-extracting this narrow set preserves cold/incremental parity when
-    //    an imported callable appears, disappears, or changes shape.
-    let zig_changed = changed.iter().any(|path| {
-        Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("zig"))
-    });
-    if zig_changed {
-        let zig_files: HashSet<String> = calls
-            .forward
+    // 9. Re-run the complete resolver for unchanged Zig files after any
+    //    source delta. Namespace and callable aliases depend on the caller's
+    //    ImportBindings, which are not stored in CallGraph; the generic
+    //    bare-name repair below cannot reconstruct that information. A
+    //    non-Zig edit can also add or remove a homonymous callable. Refreshing
+    //    all Zig callers preserves cold/incremental parity for receiver-based
+    //    namespaces, bare callable aliases, and every symbol-table change.
+    let zig_files: HashSet<String> = calls
+        .forward
+        .iter()
+        .filter(|(source, _)| {
+            !changed.contains(source.file())
+                && Path::new(source.file())
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zig"))
+        })
+        .map(|(source, _)| source.file().to_string())
+        .collect();
+    if !zig_files.is_empty() {
+        let passes: Vec<FilePass> = zig_files
             .iter()
-            .filter(|(source, edges)| {
-                !changed.contains(source.file())
-                    && Path::new(source.file())
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("zig"))
-                    && edges.iter().any(|edge| edge.receiver.is_some())
+            .filter_map(|relative| {
+                let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+                extract_file(root, &path)
             })
-            .map(|(source, _)| source.file().to_string())
             .collect();
-        if !zig_files.is_empty() {
-            let passes: Vec<FilePass> = zig_files
-                .iter()
-                .filter_map(|relative| {
-                    let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-                    extract_file(root, &path)
-                })
-                .collect();
-            let refreshed_files: HashSet<String> = passes
-                .iter()
-                .map(|pass| file_rel(root, &pass.file))
-                .collect();
-            fully_resolved_files.extend(refreshed_files.iter().cloned());
-            calls
-                .forward
-                .retain(|source, _| !refreshed_files.contains(source.file()));
-            let table = calls.symbol_table.clone();
-            let refreshed = resolve::run_with_table(root, deps, passes, table);
-            for (source, edges) in refreshed.forward {
-                calls.forward.insert(source, edges);
-            }
+        let refreshed_files: HashSet<String> = passes
+            .iter()
+            .map(|pass| file_rel(root, &pass.file))
+            .collect();
+        fully_resolved_files.extend(refreshed_files.iter().cloned());
+        calls
+            .forward
+            .retain(|source, _| !refreshed_files.contains(source.file()));
+        let table = calls.symbol_table.clone();
+        let refreshed = resolve::run_with_table(root, deps, passes, table);
+        for (source, edges) in refreshed.forward {
+            calls.forward.insert(source, edges);
         }
     }
 
@@ -451,16 +446,16 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> i128 {
 /// the same base name hash to one bucket.
 fn normalise_type_name(name: &str) -> String {
     let mut name = name.trim();
-    if let Some(i) = name.find('<') {
+    if let Some(i) = first_unquoted_byte(name, b'<') {
         name = &name[..i];
     }
-    if let Some(i) = name.find('[') {
+    if let Some(i) = first_unquoted_byte(name, b'[') {
         name = &name[..i];
     }
-    if let Some(i) = name.rfind('.') {
+    if let Some(i) = last_unquoted_byte(name, b'.') {
         name = &name[i + 1..];
     }
-    if let Some(i) = name.rfind("::") {
+    if let Some(i) = last_qualified_separator(name) {
         name = &name[i + 2..];
     }
     name.to_string()

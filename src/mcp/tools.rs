@@ -98,7 +98,7 @@ pub fn list() -> Value {
             },
             {
                 "name": "surface",
-                "description": "True public API surface — resolves `pub use` re-exports (Rust) and `__all__` (Python) to compute exactly what a downstream user sees, not just every `pub`/non-underscore item per file. Falls back to visibility-filtered output for Java/C#/Go/Kotlin (no real re-export concept). Returns text by default; set `json: true` for `ast-bro.surface.v1`.",
+                "description": "True public API surface — resolves Rust/TypeScript/Scala re-exports, Python `__all__`, and Zig public namespace aliases to compute what a downstream user sees. Falls back to visibility-filtered output for languages without re-export semantics. Returns text by default; set `json: true` for `ast-bro.surface.v1`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -106,8 +106,8 @@ pub fn list() -> Value {
                         "tree":            { "type": "boolean", "description": "Render as a hierarchical tree grouped by module." },
                         "include_chain":   { "type": "boolean", "description": "Append the via-chain on each entry (text mode only)." },
                         "max_depth":       { "type": "integer", "description": format!("Recursion guard for re-export chains (default {}).", crate::defaults::SURFACE_MAX_DEPTH) },
-                        "include_private": { "type": "boolean", "description": "Include private items — only meaningful for the fallback resolver." },
-                        "lang":            { "type": "string",  "description": "Force a resolver: `rust`, `python`, or `fallback`." },
+                        "include_private": { "type": "boolean", "description": "Include private items for Zig and fallback resolvers." },
+                        "lang":            { "type": "string",  "description": "Force a resolver: `rust`, `python`, `typescript`, `scala`, `zig`, or `fallback`." },
                         "json":            { "type": "boolean" }
                     }
                 }

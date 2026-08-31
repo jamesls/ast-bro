@@ -5,7 +5,8 @@
 //! the dict key (frozen dataclass identity), we use the integer id and pass
 //! the chunks slice to functions that need `file_path` or `content`.
 
-use crate::search::chunker::{Chunk, ChunkKind};
+use crate::search::chunker::{compare_chunk_ids, Chunk, ChunkKind};
+use crate::symbol_path::last_unquoted_separator;
 use crate::search::tokens::split_identifier;
 use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
@@ -34,7 +35,7 @@ const DEFINITION_KEYWORDS: &[&str] = &[
     "class", "module", "defmodule", "def", "interface", "struct", "enum",
     "trait", "type", "func", "function", "object", "abstract class",
     "data class", "fn", "fun", "package", "namespace", "protocol",
-    "record", "typedef",
+    "record", "typedef", "const", "var",
 ];
 
 const SQL_DEFINITION_KEYWORDS: &[&str] = &[
@@ -200,7 +201,7 @@ fn definition_pattern(symbol_name: &str) -> DefnPair {
     // not the offset.
     let prefix = r"(?:^|\s)(?:";
     let suffix = format!(
-        r")\s+(?:[A-Za-z_][A-Za-z0-9_]*(?:\.|::))*{escaped}(?:\s|[<({{:\[;]|$)",
+        r")\s+(?:[A-Za-z_][A-Za-z0-9_]*(?:\.|::))*{escaped}(?:\s|[<({{:\[;=]|$)",
     );
     let general_body: String = DEFINITION_KEYWORDS
         .iter()
@@ -241,12 +242,8 @@ fn stem_matches(stem: &str, name: &str) -> bool {
 
 fn extract_symbol_name(query: &str) -> &str {
     let trimmed = query.trim();
-    for sep in ["::", "\\", "->", "."].iter() {
-        if let Some(idx) = trimmed.rfind(sep) {
-            return &trimmed[idx + sep.len()..];
-        }
-    }
-    trimmed
+    last_unquoted_separator(trimmed, &["::", "\\", "->", "."])
+        .map_or(trimmed, |(index, width)| &trimmed[index + width..])
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -264,13 +261,15 @@ pub fn boost_multi_chunk_files(scores: &mut HashMap<u32, f32>, chunks: &[Chunk])
         return;
     }
 
-    // Walk in id order, not `HashMap` order, so the same query over the same
-    // index answers the same way twice. Two results here read the traversal
-    // order: a per-file sum, because float addition is not associative, and
-    // `best_chunk`, because an exact score tie keeps whichever chunk came
-    // first.
+    // Walk in logical chunk order, not `HashMap` or physical row order. Two
+    // results here read the traversal order: a per-file sum, because float
+    // addition is not associative, and `best_chunk`, because an exact score
+    // tie keeps whichever chunk came first. Physical row ids differ between
+    // an incremental index and its compact rebuild.
     let mut ids: Vec<u32> = scores.keys().copied().collect();
-    ids.sort_unstable();
+    ids.sort_unstable_by(|left, right| {
+        compare_chunk_ids(chunks, *left, *right).then(left.cmp(right))
+    });
 
     let mut file_sum: HashMap<&str, f32> = HashMap::new();
     let mut best_chunk: HashMap<&str, u32> = HashMap::new();
@@ -295,7 +294,9 @@ pub fn boost_multi_chunk_files(scores: &mut HashMap<u32, f32>, chunks: &[Chunk])
     }
     let boost_unit = max_score * FILE_COHERENCE_BOOST_FRAC;
     let mut boosted: Vec<(&str, u32)> = best_chunk.into_iter().collect();
-    boosted.sort_unstable_by_key(|(_, id)| *id);
+    boosted.sort_unstable_by(|(_, left), (_, right)| {
+        compare_chunk_ids(chunks, *left, *right).then(left.cmp(right))
+    });
     for (path, id) in boosted {
         let extra = boost_unit * file_sum[path] / max_file_sum;
         if let Some(s) = scores.get_mut(&id) {
@@ -308,24 +309,46 @@ pub fn boost_multi_chunk_files(scores: &mut HashMap<u32, f32>, chunks: &[Chunk])
 // Query-aware boosts (definition / stem / embedded symbol)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Apply query-type boosts to candidate scores. Returns a new map (Python
-/// version mutates a copy of the input dict).
-pub fn apply_query_boost(
+/// Apply query-aware boosts without admitting chunks outside `eligible_mask`.
+///
+/// Definition boosts scan beyond the initial candidate window. Incremental
+/// indexes therefore pass the combined live/filter mask here so that scan
+/// cannot resurrect a tombstone or bypass a query filter.
+pub(crate) fn apply_query_boost(
     combined_scores: HashMap<u32, f32>,
     query: &str,
     all_chunks: &[Chunk],
+    eligible_mask: Option<&[bool]>,
 ) -> HashMap<u32, f32> {
-    if combined_scores.is_empty() {
-        return combined_scores;
+    if let Some(mask) = eligible_mask {
+        debug_assert_eq!(mask.len(), all_chunks.len());
     }
-    let max_score = combined_scores.values().cloned().fold(0.0f32, f32::max);
     let mut boosted = combined_scores;
+    if let Some(mask) = eligible_mask {
+        boosted.retain(|id, _| mask[*id as usize]);
+    }
+    if boosted.is_empty() {
+        return boosted;
+    }
+    let max_score = boosted.values().cloned().fold(0.0f32, f32::max);
 
     if crate::search::fusion::is_symbol_query(query) {
-        boost_symbol_definitions(&mut boosted, query, max_score, all_chunks);
+        boost_symbol_definitions(
+            &mut boosted,
+            query,
+            max_score,
+            all_chunks,
+            eligible_mask,
+        );
     } else {
         boost_stem_matches(&mut boosted, query, max_score, all_chunks);
-        boost_embedded_symbols(&mut boosted, query, max_score, all_chunks);
+        boost_embedded_symbols(
+            &mut boosted,
+            query,
+            max_score,
+            all_chunks,
+            eligible_mask,
+        );
     }
     boosted
 }
@@ -348,6 +371,7 @@ fn boost_symbol_definitions(
     query: &str,
     max_score: f32,
     all_chunks: &[Chunk],
+    eligible_mask: Option<&[bool]>,
 ) {
     let trimmed = query.trim();
     let symbol_name = extract_symbol_name(query);
@@ -370,6 +394,9 @@ fn boost_symbol_definitions(
     // Scan non-candidates whose stem matches the symbol
     let symbol_lower = symbol_name.to_ascii_lowercase();
     for (id, chunk) in all_chunks.iter().enumerate() {
+        if eligible_mask.is_some_and(|mask| !mask[id]) {
+            continue;
+        }
         let id = id as u32;
         if boosted.contains_key(&id) {
             continue;
@@ -394,6 +421,7 @@ fn boost_embedded_symbols(
     query: &str,
     max_score: f32,
     all_chunks: &[Chunk],
+    eligible_mask: Option<&[bool]>,
 ) {
     let names: Vec<String> = embedded_symbol_re()
         .find_iter(query)
@@ -417,6 +445,9 @@ fn boost_embedded_symbols(
 
     let symbols_lower: Vec<String> = names.iter().map(|s| s.to_ascii_lowercase()).collect();
     for (id, chunk) in all_chunks.iter().enumerate() {
+        if eligible_mask.is_some_and(|mask| !mask[id]) {
+            continue;
+        }
         let id = id as u32;
         if boosted.contains_key(&id) {
             continue;
@@ -603,16 +634,18 @@ pub fn rerank_topk(
         });
     }
 
-    // Sort by penalised score descending, breaking ties on chunk id.
+    // Sort by penalised score descending, breaking ties on logical identity.
     //
     // The tiebreak is what makes the order total rather than merely stable:
     // `scores` is a `HashMap` whose iteration order is randomized per process,
     // so a stable sort alone would carry that randomness into the result. Ties
     // are common, since RRF maps every score onto `1 / (k + rank)` — a small
-    // set of discrete values.
+    // set of discrete values. Physical ids cannot be the tiebreak because an
+    // incremental index and a compact rebuild store the same live chunks in
+    // different slots.
     penalised.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.1.total_cmp(&a.1)
+            .then_with(|| compare_chunk_ids(chunks, a.0, b.0))
             .then(a.0.cmp(&b.0))
     });
 
@@ -642,8 +675,8 @@ pub fn rerank_topk(
     }
 
     selected.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.0.total_cmp(&a.0)
+            .then_with(|| compare_chunk_ids(chunks, a.1, b.1))
             .then(a.1.cmp(&b.1))
     });
     selected.into_iter().take(top_k).map(|(s, id)| (id, s)).collect()
@@ -750,6 +783,11 @@ mod tests {
         assert_eq!(extract_symbol_name(r"My\Namespace\Class"), "Class");
         assert_eq!(extract_symbol_name("Foo->bar"), "bar");
         assert_eq!(extract_symbol_name("a.b.c"), "c");
+        assert_eq!(extract_symbol_name(r#"@"work::later""#), r#"@"work::later""#);
+        assert_eq!(
+            extract_symbol_name(r#"pkg.@"Type.With-Dash".run"#),
+            "run"
+        );
     }
 
     #[test]
@@ -912,6 +950,24 @@ mod tests {
         assert_eq!(out[1].0, 1);
     }
 
+    #[test]
+    fn rerank_ties_follow_logical_identity_across_physical_layouts() {
+        let first_chunks = vec![ck(0, "b.rs", "b"), ck(1, "a.rs", "a")];
+        let second_chunks = vec![ck(0, "a.rs", "a"), ck(1, "b.rs", "b")];
+        let scores: HashMap<u32, f32> = [(0, 1.0), (1, 1.0)].into_iter().collect();
+
+        let paths = |chunks: &[Chunk]| {
+            rerank_topk(&scores, chunks, 2, false)
+                .into_iter()
+                .map(|(id, score)| {
+                    (chunks[id as usize].file_path.clone(), score.to_bits())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&first_chunks), paths(&second_chunks));
+        assert_eq!(paths(&first_chunks)[0].0, "a.rs");
+    }
+
     // ── apply_query_boost (end-to-end) ────────────────────────────────────
 
     #[test]
@@ -921,8 +977,48 @@ mod tests {
             ck(1, "src/stack.rs", "struct HandlerStack { items: Vec<u32> }"),  // defines
         ];
         let scores: HashMap<u32, f32> = [(0u32, 0.5f32), (1u32, 0.3f32)].into_iter().collect();
-        let boosted = apply_query_boost(scores, "HandlerStack", &chunks);
+        let boosted = apply_query_boost(scores, "HandlerStack", &chunks, None);
         // The defining chunk should now outrank the using chunk.
+        assert!(boosted[&1] > boosted[&0]);
+    }
+
+    #[test]
+    fn query_boost_does_not_resurrect_a_tombstoned_definition() {
+        let chunks = vec![
+            ck(0, "src/widget.zig", "pub const Widget = struct {};"),
+            ck(1, "src/use.zig", "fn use_widget() void {}"),
+        ];
+        let scores: HashMap<u32, f32> = [(1, 0.5)].into_iter().collect();
+        let boosted = apply_query_boost(scores, "Widget", &chunks, Some(&[false, true]));
+        assert!(!boosted.contains_key(&0));
+        assert!(boosted.contains_key(&1));
+    }
+
+    #[test]
+    fn boost_recognizes_zig_const_type_definitions() {
+        let chunks = vec![
+            ck(0, "src/use.zig", "fn parse() void { use(PageSizeParseError); }"),
+            ck(
+                1,
+                "src/options.zig",
+                "pub const PageSizeParseError = error{InvalidPageSize};",
+            ),
+        ];
+        let scores: HashMap<u32, f32> = [(0_u32, 0.5_f32), (1_u32, 0.3_f32)]
+            .into_iter()
+            .collect();
+        let boosted = apply_query_boost(scores, "PageSizeParseError", &chunks, None);
+        assert!(boosted[&1] > boosted[&0]);
+    }
+
+    #[test]
+    fn boost_recognizes_escaped_zig_callable_definition() {
+        let chunks = vec![
+            ck(0, "src/use.zig", r#"helper.@"work::later"();"#),
+            ck(1, "src/helper.zig", r#"pub fn @"work::later"() void {}"#),
+        ];
+        let scores: HashMap<u32, f32> = [(0, 0.5), (1, 0.3)].into_iter().collect();
+        let boosted = apply_query_boost(scores, r#"@"work::later""#, &chunks, None);
         assert!(boosted[&1] > boosted[&0]);
     }
 
@@ -934,7 +1030,7 @@ mod tests {
         ];
         let scores: HashMap<u32, f32> = [(0u32, 0.5f32), (1u32, 0.5f32)].into_iter().collect();
         // NL query mentioning "login" should boost the login.rs chunk.
-        let boosted = apply_query_boost(scores, "how does login work", &chunks);
+        let boosted = apply_query_boost(scores, "how does login work", &chunks, None);
         assert!(boosted[&0] > boosted[&1]);
     }
 }

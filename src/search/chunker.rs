@@ -8,10 +8,11 @@
 //!   ast-grep, descending through type containers to reach them. The chunker
 //!   doesn't need a per-language outline adapter; it only needs the AST root +
 //!   iteration of named children.
-//! - **Markdown** (`.md`/`.markdown`/`.mdx`/`.mdown`) — split at `section`
-//!   boundaries via raw `tree_sitter_md`.
-//! - **Plain text** (`.toml`, `.zig`, PowerShell `.ps1`/`.psm1`/`.psd1`) —
-//!   formats with no tree-sitter grammar in `SupportLang`; split at blank-line
+//! - **Raw tree-sitter**: Markdown (`.md`/`.markdown`/`.mdx`/`.mdown`) splits
+//!   at `section` boundaries, while Zig (`.zig`) uses declaration-aware
+//!   member, body, breadcrumb, and outline extraction.
+//! - **Plain text** (`.toml`, PowerShell `.ps1`/`.psm1`/`.psd1`) — formats
+//!   with no usable tree-sitter grammar in `SupportLang`; split at blank-line
 //!   boundaries (LF or CRLF). Files without blank lines become one oversized
 //!   chunk, which the packer already tolerates. Note: sources must be UTF-8 —
 //!   UTF-16-encoded `.ps1` files fail `read_to_string` and are skipped, like
@@ -30,6 +31,7 @@
 use ast_grep_core::{AstGrep, Language};
 use ast_grep_language::{LanguageExt, SupportLang};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::path::Path;
 
 /// Target chunk size in characters. Chunks may exceed this when a declaration
@@ -42,7 +44,7 @@ pub const MAX_CHARS: usize = 1500;
 /// sit *inside* an `Enclosing` one, so the two levels overlap on purpose — a
 /// query can match the specific statement or the method that contains it.
 /// `Outline` is synthesized and covers no source bytes of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum ChunkKind {
     /// A contiguous slice of the file, packed at member boundaries.
     #[default]
@@ -76,11 +78,37 @@ pub struct Chunk {
     pub kind: ChunkKind,
 }
 
+/// Compare chunks by persistent content identity rather than storage position.
+///
+/// Incremental indexes retain tombstoned slots and append replacement chunks,
+/// so a live chunk's vector index is not stable across an incremental update
+/// and a compact rebuild. Every field participates after the source location;
+/// two chunks compare equal only when they are indistinguishable to callers.
+pub(crate) fn compare_chunk_identity(left: &Chunk, right: &Chunk) -> Ordering {
+    left.file_path
+        .cmp(&right.file_path)
+        .then(left.start_byte.cmp(&right.start_byte))
+        .then(left.end_byte.cmp(&right.end_byte))
+        .then(left.kind.cmp(&right.kind))
+        .then(left.start_line.cmp(&right.start_line))
+        .then(left.end_line.cmp(&right.end_line))
+        .then(left.breadcrumb.cmp(&right.breadcrumb))
+        .then(left.language.cmp(&right.language))
+        .then(left.content.cmp(&right.content))
+}
+
+/// Compare two physical chunk ids by their persistent chunk identity.
+pub(crate) fn compare_chunk_ids(chunks: &[Chunk], left: u32, right: u32) -> Ordering {
+    compare_chunk_identity(&chunks[left as usize], &chunks[right as usize])
+}
+
 /// Strategy used to chunk a given file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkerKind {
     AstGrep(SupportLang),
     Markdown,
+    /// Declaration-aware chunking through the raw `tree-sitter-zig` parser.
+    Zig,
     /// Blank-line-delimited plain text; carries the language label to report
     /// (e.g. `"toml"`, `"powershell"`).
     Plain(&'static str),
@@ -94,6 +122,7 @@ impl ChunkerKind {
         match self {
             ChunkerKind::AstGrep(lang) => format!("{lang:?}").to_ascii_lowercase(),
             ChunkerKind::Markdown => "markdown".to_string(),
+            ChunkerKind::Zig => "zig".to_string(),
             ChunkerKind::Plain(name) => name.to_string(),
         }
     }
@@ -102,8 +131,8 @@ impl ChunkerKind {
 /// Decide whether `path` is indexable, and how.
 ///
 /// Returns `Some(Markdown)` for `.md`/`.markdown`/`.mdx`/`.mdown` (handled via
-/// `tree_sitter_md`), `Some(Plain(_))` for `.toml`, `.zig`, and PowerShell
-/// `.ps1`/`.psm1`/`.psd1` (blank-line-delimited plain text),
+/// `tree_sitter_md`), `Some(Zig)` for `.zig`, `Some(Plain(_))` for `.toml`
+/// and PowerShell `.ps1`/`.psm1`/`.psd1` (blank-line-delimited plain text),
 /// `Some(AstGrep(lang))` for any extension ast-grep claims it can parse, and
 /// `None` otherwise.
 pub fn is_indexable(path: &Path) -> Option<ChunkerKind> {
@@ -118,7 +147,7 @@ pub fn is_indexable(path: &Path) -> Option<ChunkerKind> {
         return Some(ChunkerKind::Plain("toml"));
     }
     if ext.as_deref() == Some("zig") {
-        return Some(ChunkerKind::Plain("zig"));
+        return Some(ChunkerKind::Zig);
     }
     if matches!(ext.as_deref(), Some("ps1" | "psm1" | "psd1")) {
         return Some(ChunkerKind::Plain("powershell"));
@@ -151,18 +180,34 @@ pub fn chunk_source(source: &str, file_path: &str, kind: ChunkerKind) -> Vec<Chu
     }
     let lang_name = kind.language_name();
     let lines = LineIndex::new(source);
-    let lang = match kind {
-        ChunkerKind::AstGrep(lang) => lang,
+    let plan = match kind {
+        ChunkerKind::AstGrep(lang) => build_split_plan(source, lang),
+        ChunkerKind::Zig => build_zig_split_plan(source),
         ChunkerKind::Plain(_) => {
             // Blank-line paragraphs; this strategy has no syntax tree from
             // which to synthesize an outline.
             let points = paragraph_split_points(source);
-            return pack(source, file_path, &lang_name, &lines, &points, ChunkKind::Source, "");
+            return pack(
+                source,
+                file_path,
+                &lang_name,
+                &lines,
+                &points,
+                ChunkKind::Source,
+                "",
+            );
         }
         ChunkerKind::Markdown => {
             let points = markdown_split_points(source);
-            let mut chunks =
-                pack(source, file_path, &lang_name, &lines, &points, ChunkKind::Source, "");
+            let mut chunks = pack(
+                source,
+                file_path,
+                &lang_name,
+                &lines,
+                &points,
+                ChunkKind::Source,
+                "",
+            );
             // Markdown needs outlines as much as code does, and for a sharper
             // reason: two-phase retrieval can only ever *raise* a file's score,
             // so a file with no outline cannot compete with one that has them.
@@ -173,8 +218,6 @@ pub fn chunk_source(source: &str, file_path: &str, kind: ChunkerKind) -> Vec<Chu
             return chunks;
         }
     };
-
-    let plan = build_split_plan(source, lang);
     let mut chunks = pack(
         source,
         file_path,
@@ -284,6 +327,312 @@ fn build_split_plan(source: &str, lang: SupportLang) -> SplitPlan {
         plan.member_points.push(source.len());
     }
     plan
+}
+
+/// Build the same hierarchy as the ast-grep path using Zig's raw parser.
+///
+/// Zig is not exposed through `ast_grep_language::SupportLang`, but the
+/// bundled grammar still provides all boundaries the chunker needs. Keeping
+/// this path structural gives Zig files outlines, breadcrumbs, and callable
+/// body parts instead of treating source as blank-line-delimited prose.
+fn build_zig_split_plan(source: &str) -> SplitPlan {
+    let mut plan = SplitPlan {
+        member_points: vec![0],
+        ..SplitPlan::default()
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_zig::LANGUAGE.into())
+        .is_err()
+    {
+        plan.member_points.push(source.len());
+        return plan;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        plan.member_points.push(source.len());
+        return plan;
+    };
+
+    let mut trail = Vec::new();
+    collect_zig_split_points(
+        tree.root_node(),
+        source,
+        &mut plan,
+        &mut trail,
+        Descent::root(source.len()),
+    );
+    if *plan.member_points.last().unwrap() < source.len() {
+        plan.member_points.push(source.len());
+    }
+    plan
+}
+
+fn collect_zig_split_points(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    plan: &mut SplitPlan,
+    trail: &mut Vec<String>,
+    descent: Descent,
+) {
+    let source_len = source.len();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let kind = child.kind();
+        let member = zig_is_member_kind(kind)
+            || (node.kind() == "error_set_declaration" && kind == "identifier");
+        let callable = zig_is_callable_kind(kind);
+        let start = child.start_byte();
+        let end = child.end_byte();
+        let name = zig_node_name(child, source);
+
+        if member {
+            let breadcrumb = join_trail(trail, name.as_deref());
+            plan.members.push(MemberSpan {
+                start,
+                end,
+                breadcrumb: breadcrumb.clone(),
+                signature: zig_signature_of(child, source),
+            });
+            if callable && end.saturating_sub(start) > MAX_CHARS {
+                let mut points = vec![start];
+                collect_zig_body_points(child, source_len, &mut points);
+                if points.last() != Some(&end) && end <= source_len {
+                    points.push(end);
+                }
+                if points.len() > 2 {
+                    plan.deep.push(DeepRegion {
+                        start,
+                        end,
+                        breadcrumb,
+                        points,
+                    });
+                }
+            }
+        }
+
+        // A Zig type declaration is an expression on the right-hand side of
+        // a variable or field (`const Widget = struct { ... }`). Open that
+        // expression so its methods and fields receive the same hierarchy as
+        // members of a Rust or Python type. Callable bodies stay opaque.
+        if !callable && !descent.exhausted() {
+            let containers = if zig_is_container_kind(kind) {
+                vec![child]
+            } else if member {
+                zig_embedded_containers(child)
+            } else {
+                Vec::new()
+            };
+            for container in containers {
+                let pushed = name.is_some() && !zig_is_container_kind(kind);
+                if pushed {
+                    trail.push(name.clone().unwrap());
+                }
+                collect_zig_split_points(
+                    container,
+                    source,
+                    plan,
+                    trail,
+                    descent.into_child(container.end_byte().saturating_sub(container.start_byte())),
+                );
+                if pushed {
+                    trail.pop();
+                }
+            }
+        }
+
+        // At file scope every named node is a safe boundary (comments and
+        // recovered ERROR nodes included). Within a container, only actual
+        // members split source so expressions are never cut in half.
+        if descent.ast > 0 && !member {
+            continue;
+        }
+        if end > *plan.member_points.last().unwrap() && end <= source_len {
+            plan.member_points.push(end);
+        }
+    }
+}
+
+fn zig_is_member_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "variable_declaration"
+            | "function_declaration"
+            | "test_declaration"
+            | "comptime_declaration"
+            | "using_namespace_declaration"
+            | "container_field"
+    )
+}
+
+fn zig_is_callable_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration" | "test_declaration" | "comptime_declaration"
+    )
+}
+
+fn zig_is_container_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "struct_declaration"
+            | "enum_declaration"
+            | "union_declaration"
+            | "opaque_declaration"
+            | "error_set_declaration"
+    )
+}
+
+fn zig_embedded_containers(node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut containers = Vec::new();
+    collect_zig_embedded_containers(node, &mut containers);
+    containers
+}
+
+fn collect_zig_embedded_containers<'tree>(
+    node: tree_sitter::Node<'tree>,
+    containers: &mut Vec<tree_sitter::Node<'tree>>,
+) {
+    if zig_is_container_kind(node.kind()) {
+        containers.push(node);
+        return;
+    }
+    if zig_is_callable_kind(node.kind()) {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_zig_embedded_containers(child, containers);
+    }
+}
+
+fn zig_node_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if let Some(name) = node.child_by_field_name("name") {
+        let text = zig_node_text(name, source).trim();
+        if !text.is_empty() {
+            return Some(if name.kind() == "string" {
+                text.strip_prefix('"')
+                    .and_then(|text| text.strip_suffix('"'))
+                    .unwrap_or(text)
+                    .to_string()
+            } else {
+                text.to_string()
+            });
+        }
+    }
+
+    match node.kind() {
+        "variable_declaration" => {
+            let mut cursor = node.walk();
+            let name = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+                .map(|child| zig_node_text(child, source).to_string());
+            name
+        }
+        "test_declaration" => {
+            let mut cursor = node.walk();
+            let name = node
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "string" | "identifier"))
+                .map(|child| {
+                    let text = zig_node_text(child, source).trim();
+                    if child.kind() == "string" {
+                        text.strip_prefix('"')
+                            .and_then(|text| text.strip_suffix('"'))
+                            .unwrap_or(text)
+                            .to_string()
+                    } else {
+                        text.to_string()
+                    }
+                })
+                .or_else(|| Some(format!("test@{}", node.start_position().row + 1)));
+            name
+        }
+        "comptime_declaration" => Some(format!(
+            "comptime@L{}C{}",
+            node.start_position().row + 1,
+            node.start_position().column + 1
+        )),
+        "using_namespace_declaration" => Some("usingnamespace".to_string()),
+        "identifier" => Some(zig_node_text(node, source).trim().to_string()),
+        _ => None,
+    }
+}
+
+fn zig_signature_of(node: tree_sitter::Node<'_>, source: &str) -> String {
+    let body_start = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .or_else(|| {
+            if matches!(node.kind(), "test_declaration" | "comptime_declaration") {
+                let mut cursor = node.walk();
+                let body_start = node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "block")
+                    .map(|body| body.start_byte());
+                body_start
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            let container = zig_embedded_containers(node).into_iter().next()?;
+            let mut cursor = container.walk();
+            let brace_start = container
+                .children(&mut cursor)
+                .find(|child| child.kind() == "{")
+                .map(|brace| brace.start_byte());
+            brace_start
+        });
+    let end = body_start.unwrap_or_else(|| node.end_byte());
+    let slice = source.get(node.start_byte()..end).unwrap_or("");
+    flatten_signature(slice)
+}
+
+fn flatten_signature(slice: &str) -> String {
+    let mut flat = String::with_capacity(slice.len());
+    for word in slice.split_whitespace() {
+        if !flat.is_empty() {
+            flat.push(' ');
+        }
+        flat.push_str(word);
+    }
+    let flat = flat
+        .trim_end_matches(&[' ', '{', ';', ','][..])
+        .trim()
+        .to_string();
+    if flat.len() <= MAX_SIGNATURE_CHARS {
+        return flat;
+    }
+    let mut cut = MAX_SIGNATURE_CHARS;
+    while !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &flat[..cut])
+}
+
+fn collect_zig_body_points(
+    node: tree_sitter::Node<'_>,
+    source_len: usize,
+    points: &mut Vec<usize>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "block" {
+            collect_zig_body_points(child, source_len, points);
+            continue;
+        }
+        if node.kind() == "block"
+            && child.end_byte() > *points.last().unwrap()
+            && child.end_byte() <= source_len
+        {
+            points.push(child.end_byte());
+        }
+    }
+}
+
+fn zig_node_text<'source>(node: tree_sitter::Node<'_>, source: &'source str) -> &'source str {
+    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
 /// Maximum *narrowing* levels the member walk descends.
@@ -989,7 +1338,14 @@ fn pack(
         if cur_size == 0 {
             cur_start = w[0];
             cur_end = w[1];
-        } else if cur_size + region_size <= MAX_CHARS {
+        } else if source[w[0]..w[1]].trim().is_empty()
+            || source[cur_start..cur_end].trim().is_empty()
+            || cur_size + region_size <= MAX_CHARS
+        {
+            // Whitespace-only gaps belong to an adjacent source chunk even
+            // when that declaration is already oversized. Emitting or
+            // dropping a standalone final newline breaks the byte-exact
+            // Source+Enclosing tiling invariant.
             cur_end = w[1];
         } else {
             flush(cur_start, cur_end, &mut chunks);
@@ -1558,7 +1914,7 @@ content c
 
     #[test]
     fn rust_impl_block_splits_per_method() {
-        let body = filler(20, "x").replace("//", "//");
+        let body = filler(20, "x");
         let src = format!(
             "pub struct S;\nimpl S {{\n  pub fn one(&self) {{\n{body}  }}\n  pub fn two(&self) {{\n{body}  }}\n}}\n"
         );
@@ -1829,14 +2185,14 @@ content c
     }
 
     #[test]
-    fn is_indexable_accepts_plain_text_formats() {
+    fn is_indexable_accepts_non_ast_grep_formats() {
         assert_eq!(
             is_indexable(&PathBuf::from("Cargo.toml")),
             Some(ChunkerKind::Plain("toml"))
         );
         assert_eq!(
             is_indexable(&PathBuf::from("src/main.ZIG")),
-            Some(ChunkerKind::Plain("zig"))
+            Some(ChunkerKind::Zig)
         );
         for ext in ["ps1", "psm1", "psd1"] {
             assert_eq!(
@@ -1848,26 +2204,110 @@ content c
     }
 
     #[test]
-    fn zig_uses_plain_blank_line_chunking() {
-        let function = |name| {
-            format!(
-                "fn {name}() void {{\n    // {}\n}}\n",
-                "padding ".repeat(120)
-            )
-        };
-        let src = [function("alpha"), function("beta"), function("gamma")].join("\n");
+    fn zig_uses_declaration_chunks_breadcrumbs_parts_and_outline() {
+        let statements = "        helper();\n".repeat(180);
+        let src = format!(
+            "pub const Widget = struct {{\n    pub fn alpha() void {{\n{statements}    }}\n\n    fn beta() void {{}}\n}};\n\npub const @\"Type.With-Dash\" = struct {{\n    pub fn @\"run-it\"() void {{}}\n}};\n\npub fn helper() void {{}}\n"
+        );
         let kind = is_indexable(&PathBuf::from("src/main.zig")).unwrap();
 
         let chunks = chunk_source(&src, "src/main.zig", kind);
 
-        assert_eq!(chunks.len(), 3, "one chunk per oversized paragraph");
         assert!(chunks.iter().all(|chunk| chunk.language == "zig"));
-        assert!(chunks.iter().all(|chunk| chunk.kind == ChunkKind::Source));
-        assert!(chunks
+        let outline = chunks
             .iter()
-            .all(|chunk| chunk.content.matches("fn ").count() == 1));
-        let joined: String = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
-        assert_eq!(joined, src, "plain chunks must cover the source exactly");
+            .find(|chunk| chunk.kind == ChunkKind::Outline)
+            .expect("Zig outline");
+        assert!(outline
+            .content
+            .contains("Widget :: pub const Widget = struct"));
+        assert!(outline
+            .content
+            .contains("Widget > alpha :: pub fn alpha() void"));
+        assert!(outline.content.contains("Widget > beta :: fn beta() void"));
+        assert!(outline.content.contains("helper :: pub fn helper() void"));
+        assert!(outline.content.contains(
+            "@\"Type.With-Dash\" :: pub const @\"Type.With-Dash\" = struct"
+        ));
+        assert!(outline.content.contains(
+            "@\"Type.With-Dash\" > @\"run-it\" :: pub fn @\"run-it\"() void"
+        ));
+
+        let parts: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| chunk.kind == ChunkKind::Part)
+            .collect();
+        assert!(
+            parts.len() > 1,
+            "oversized Zig callable needs body parts: {chunks:#?}"
+        );
+        assert!(parts
+            .iter()
+            .all(|chunk| chunk.breadcrumb == "Widget > alpha"));
+
+        let joined: String = chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.kind, ChunkKind::Source | ChunkKind::Enclosing))
+            .map(|chunk| chunk.content.as_str())
+            .collect();
+        assert_eq!(joined, src, "structural chunks must cover source exactly");
+    }
+
+    #[test]
+    fn zig_error_members_are_listed_and_trailing_newline_stays_in_source_tiles() {
+        let oversized = format!("pub fn huge() void {{\n{} }}\n", "    helper();\n".repeat(220));
+        let src = format!(
+            "pub const ParseError = error{{\n    InvalidPage,\n    UnsupportedRequestPayer,\n}};\n{oversized}"
+        );
+        let chunks = chunk_source(&src, "src/options.zig", ChunkerKind::Zig);
+        let outline = chunks
+            .iter()
+            .find(|chunk| chunk.kind == ChunkKind::Outline)
+            .expect("Zig outline");
+        assert!(
+            outline
+                .content
+                .contains("ParseError > UnsupportedRequestPayer :: UnsupportedRequestPayer"),
+            "error-set member missing from outline: {}",
+            outline.content
+        );
+        let joined: String = chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.kind, ChunkKind::Source | ChunkKind::Enclosing))
+            .map(|chunk| chunk.content.as_str())
+            .collect();
+        assert_eq!(joined, src, "oversized final member lost trailing bytes");
+    }
+
+    #[test]
+    fn zig_wrapped_initializer_shapes_reach_the_outline() {
+        let src = r#"pub const Cases = [_]struct {
+    name: []const u8,
+    expected: usize,
+}{};
+pub const Nested = .{
+    struct { value: u8 }{ .value = 1 },
+};
+pub const CombinedError = error{ BadMagic } || error{ InvalidData };
+"#;
+        let chunks = chunk_source(src, "src/shapes.zig", ChunkerKind::Zig);
+        let outline = chunks
+            .iter()
+            .find(|chunk| chunk.kind == ChunkKind::Outline)
+            .expect("Zig outline");
+        for expected in [
+            "Cases > name :: name: []const u8",
+            "Cases > expected :: expected: usize",
+            "Nested > value :: value: u8",
+            "CombinedError > BadMagic :: BadMagic",
+            "CombinedError > InvalidData :: InvalidData",
+        ] {
+            assert!(
+                outline.content.contains(expected),
+                "wrapped declaration missing {expected:?}: {}",
+                outline.content
+            );
+        }
     }
 
     #[test]

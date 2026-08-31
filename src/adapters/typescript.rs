@@ -895,14 +895,24 @@ fn _handle_import_stmt<'a, D: Doc>(
                 match ik {
                     "identifier" => {
                         let local = String::from_utf8_lossy(&src[inner.range()]).to_string();
-                        out.push(ImportBinding { local, module: source.clone(), line });
+                        out.push(ImportBinding {
+                            local,
+                            module: source.clone(),
+                            member_path: Vec::new(),
+                            line,
+                        });
                     }
                     "namespace_import" => {
                         // namespace_import has children including `* as ident`
                         for ns in inner.children() {
                             if matches!(ns.kind().as_ref(), "identifier") {
                                 let local = String::from_utf8_lossy(&src[ns.range()]).to_string();
-                                out.push(ImportBinding { local, module: source.clone(), line });
+                                out.push(ImportBinding {
+                                    local,
+                                    module: source.clone(),
+                                    member_path: Vec::new(),
+                                    line,
+                                });
                             }
                         }
                     }
@@ -921,6 +931,7 @@ fn _handle_import_stmt<'a, D: Doc>(
                                     out.push(ImportBinding {
                                         local,
                                         module: source.clone(),
+                                        member_path: Vec::new(),
                                         line,
                                     });
                                 }

@@ -2,6 +2,10 @@ use colored::Colorize;
 use serde::{Serialize, Serializer};
 use std::path::{Path, PathBuf};
 
+use crate::symbol_path::{
+    first_unquoted_byte, last_qualified_separator, last_unquoted_byte, split_dotted,
+};
+
 // Stable JSON schema identifiers — bump on breaking changes.
 pub const JSON_SCHEMA_MAP: &str = "ast-bro.map.v1";
 /// `show` became a multi-file command (it accepts a file list, a directory,
@@ -21,14 +25,11 @@ pub const JSON_SCHEMA_CALLEES: &str = "ast-bro.callees.v1";
 pub const JSON_SCHEMA_TRACE: &str = "ast-bro.trace.v1";
 pub const JSON_SCHEMA_RUN: &str = "ast-bro.run.v1";
 /// Unified on-disk cache holding both the file-level dep graph and (lazily)
-/// the symbol-level call graph. Bumped from `graph-index.v1` to `v2` after
-/// the per-file-invalidation work removed `skip_serializing_if` from
-/// `DepEdge` and `CallEdge` Option/Vec fields — bincode uses positional
-/// encoding so a skipped field corrupts everything that follows. v1 caches
-/// were silently un-decodable (the loader returned `None` and rebuilt
-/// every time, masking the bug). The v2 bump ensures upgrading users get
-/// a clean rebuild rather than continuing to hit the silent fallback.
-pub const JSON_SCHEMA_GRAPH_INDEX: &str = "ast-bro.graph-index.v2";
+/// the symbol-level call graph. v2 fixed positional bincode fields. v3 forces
+/// one clean rebuild after Zig extraction and resolution gained namespace
+/// aliases, `usingnamespace`, visibility enforcement, and escaped identifiers;
+/// otherwise an unchanged project could retain the partial v2 call graph.
+pub const JSON_SCHEMA_GRAPH_INDEX: &str = "ast-bro.graph-index.v3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Default)]
 pub enum DeclarationKind {
@@ -245,6 +246,12 @@ pub struct ImportBinding {
     /// Module specifier as written: `crate::net::Bar`, `numpy.linalg`,
     /// `./helpers`, `com.foo.Bar`.
     pub module: String,
+    /// Declaration path reached after loading the module. This is empty for
+    /// direct imports. Zig facade aliases such as
+    /// `const Pool = @import("pool.zig").Config` store `["Config"]` so call
+    /// resolution can distinguish the imported module from its exposed scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_path: Vec<String>,
     /// 1-indexed line of the import statement.
     pub line: u32,
 }
@@ -1320,7 +1327,7 @@ pub struct SymbolMatch {
 }
 
 pub fn find_symbols(result: &ParseResult, symbol: &str) -> Vec<SymbolMatch> {
-    let parts: Vec<&str> = symbol.split('.').collect();
+    let parts = split_dotted(symbol);
     let mut matches = Vec::new();
     _search_walk(
         &result.declarations,
@@ -1513,16 +1520,16 @@ fn _impl_match(path: &std::path::Path, d: &Declaration, via: Vec<String>) -> Imp
 
 fn _normalize_type_name(name: &str) -> String {
     let mut name = name.trim();
-    if let Some(i) = name.find('<') {
+    if let Some(i) = first_unquoted_byte(name, b'<') {
         name = &name[..i];
     }
-    if let Some(i) = name.find('[') {
+    if let Some(i) = first_unquoted_byte(name, b'[') {
         name = &name[..i];
     }
-    if let Some(i) = name.rfind('.') {
+    if let Some(i) = last_unquoted_byte(name, b'.') {
         name = &name[i + 1..];
     }
-    if let Some(i) = name.rfind("::") {
+    if let Some(i) = last_qualified_separator(name) {
         name = &name[i + 2..];
     }
     name.to_string()

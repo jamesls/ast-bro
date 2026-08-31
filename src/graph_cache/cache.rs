@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 pub const CACHE_SCHEMA: &str = JSON_SCHEMA_GRAPH_INDEX;
 /// Legacy schema from pre-rename installs — still readable.
-pub const CACHE_SCHEMA_LEGACY: &str = "ast-outline.graph-index.v2";
+pub const CACHE_SCHEMA_LEGACY: &str = "ast-outline.graph-index.v3";
 
 /// On-disk wrapper combining the unified graph + the file fingerprints used
 /// for freshness detection.
@@ -280,20 +280,29 @@ mod tests {
     }
 
     #[test]
-    fn graph_index_v1_cache_is_invalidated() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let path = cache_path(root);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let stale = CacheFile {
-            schema: "ast-bro.graph-index.v1".to_string(),
-            graph: UnifiedGraph::from_deps(DepGraph::empty(root.to_path_buf())),
-            files: Vec::new(),
-        };
-        let bytes = encode_to_vec(&stale, bincode::config::standard()).unwrap();
-        fs::write(path, bytes).unwrap();
+    fn graph_index_v1_and_v2_caches_are_invalidated() {
+        for schema in [
+            "ast-bro.graph-index.v1",
+            "ast-bro.graph-index.v2",
+            "ast-outline.graph-index.v2",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let path = cache_path(root);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let stale = CacheFile {
+                schema: schema.to_string(),
+                graph: UnifiedGraph::from_deps(DepGraph::empty(root.to_path_buf())),
+                files: Vec::new(),
+            };
+            let bytes = encode_to_vec(&stale, bincode::config::standard()).unwrap();
+            fs::write(path, bytes).unwrap();
 
-        assert!(matches!(load_with_delta(root), LoadOutcome::Missing));
+            assert!(
+                matches!(load_with_delta(root), LoadOutcome::Missing),
+                "schema {schema} should be invalidated by {CACHE_SCHEMA}"
+            );
+        }
     }
 
     /// Cold build → on-disk cache has `calls: None`. After `promote_calls`,

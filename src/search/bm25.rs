@@ -46,8 +46,48 @@ impl Bm25Index {
     }
 
     pub fn build_with_params(docs: Vec<Vec<String>>, k1: f32, b: f32) -> Self {
-        let n_docs = docs.len();
-        let doc_len: Vec<u32> = docs.iter().map(|d| d.len() as u32).collect();
+        Self::build_with_params_and_live_mask(docs, k1, b, None)
+    }
+
+    /// Build a slot-aligned index while excluding dead slots from corpus
+    /// statistics and postings.
+    ///
+    /// Incremental indexes retain tombstoned chunk ids so their chunks and
+    /// embeddings remain aligned. Those dead slots must not increase `N` or
+    /// reduce `avgdl`, otherwise unchanged live documents score differently
+    /// from the same corpus after a cold rebuild.
+    pub fn build_with_live_mask(docs: Vec<Vec<String>>, live_mask: &[bool]) -> Self {
+        Self::build_with_params_and_live_mask(
+            docs,
+            DEFAULT_K1,
+            DEFAULT_B,
+            Some(live_mask),
+        )
+    }
+
+    fn build_with_params_and_live_mask(
+        docs: Vec<Vec<String>>,
+        k1: f32,
+        b: f32,
+        live_mask: Option<&[bool]>,
+    ) -> Self {
+        if let Some(mask) = live_mask {
+            assert_eq!(mask.len(), docs.len(), "live mask must match document slots");
+        }
+
+        let is_live = |doc_id: usize| live_mask.is_none_or(|mask| mask[doc_id]);
+        let n_docs = (0..docs.len()).filter(|&doc_id| is_live(doc_id)).count();
+        let doc_len: Vec<u32> = docs
+            .iter()
+            .enumerate()
+            .map(|(doc_id, doc)| {
+                if is_live(doc_id) {
+                    doc.len() as u32
+                } else {
+                    0
+                }
+            })
+            .collect();
         let avgdl = if n_docs == 0 {
             0.0
         } else {
@@ -61,6 +101,9 @@ impl Bm25Index {
         let mut postings: Vec<Vec<(u32, u32)>> = Vec::new();
 
         for (doc_id, tokens) in docs.iter().enumerate() {
+            if !is_live(doc_id) {
+                continue;
+            }
             // Per-doc token frequencies. Use a small HashMap; could swap for
             // a vec-of-(term_id, count) sort+dedupe if profiling shows hot.
             let mut tf: HashMap<u32, u32> = HashMap::with_capacity(tokens.len().min(64));
@@ -243,6 +286,33 @@ mod tests {
         assert_eq!(masked[0], unmasked[0]);
         assert_eq!(masked[1], 0.0);
         assert_eq!(masked[2], unmasked[2]);
+    }
+
+    #[test]
+    fn tombstones_do_not_change_live_document_scores() {
+        let live_a = vec![s("pool"), s("probe"), s("probe")];
+        let dead = vec![s("pool"), s("unrelated"), s("tokens"), s("tokens")];
+        let live_b = vec![s("probe"), s("window")];
+
+        let cold = Bm25Index::build(vec![live_a.clone(), live_b.clone()]);
+        let warm = Bm25Index::build_with_live_mask(
+            vec![live_a, dead, live_b],
+            &[true, false, true],
+        );
+        let query = vec![s("pool"), s("probe")];
+        let cold_scores = cold.get_scores(&query, None);
+        let warm_scores = warm.get_scores(&query, Some(&[true, false, true]));
+
+        assert_eq!(warm.doc_count(), 3, "physical slots stay aligned");
+        assert_eq!(warm.doc_len, vec![3, 0, 2]);
+        assert_eq!(warm.avgdl, cold.avgdl);
+        assert_eq!(warm_scores[0], cold_scores[0]);
+        assert_eq!(warm_scores[1], 0.0);
+        assert_eq!(warm_scores[2], cold_scores[1]);
+
+        let cold_first = usize::from(cold_scores[1] > cold_scores[0]);
+        let warm_first = usize::from(warm_scores[2] > warm_scores[0]);
+        assert_eq!(warm_first, cold_first);
     }
 
     #[test]

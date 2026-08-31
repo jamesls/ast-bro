@@ -3,6 +3,7 @@
 //! while the symbol-resolution logic has one home.
 
 use crate::calls::graph::{CallGraph, Qn};
+use crate::symbol_path::{first_single_colon, split_dotted, split_qualified};
 use std::collections::BTreeSet;
 
 /// What a resolved target qn refers to. Lets the caller dispatch to either
@@ -46,7 +47,7 @@ pub fn resolve_target_qns(calls: &CallGraph, target: &str) -> Vec<Qn> {
 /// it's a callable or a type. Both halves are searched and deduped together.
 pub fn resolve_target_full(calls: &CallGraph, target: &str) -> Vec<ResolvedTarget> {
     let (file_filter, symbol) = split_file_filter(target);
-    let parts: Vec<&str> = symbol.split('.').collect();
+    let parts = split_dotted(symbol);
 
     let mut out: Vec<ResolvedTarget> = Vec::new();
     for qn in collect_callable_qns(calls) {
@@ -80,22 +81,11 @@ pub fn resolve_target_full(calls: &CallGraph, target: &str) -> Vec<ResolvedTarge
 /// `src/foo.rs:bar` → `(Some("src/foo.rs"), "bar")`. Plain symbol → `(None, target)`.
 /// `::`-only inputs (already-qualified qns) stay intact.
 fn split_file_filter(target: &str) -> (Option<&str>, &str) {
-    let mut i = 0;
-    let bytes = target.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b':' {
-            // Skip over `::` (already-qualified-name segment separator).
-            if bytes.get(i + 1) == Some(&b':') {
-                i += 2;
-                continue;
-            }
-            let (file, rest) = (&target[..i], &target[i + 1..]);
-            if file.is_empty() || rest.is_empty() {
-                return (None, target);
-            }
+    if let Some(index) = first_single_colon(target) {
+        let (file, rest) = (&target[..index], &target[index + 1..]);
+        if !file.is_empty() && !rest.is_empty() {
             return (Some(file), rest);
         }
-        i += 1;
     }
     (None, target)
 }
@@ -124,7 +114,7 @@ fn qn_matches(qn: &Qn, raw: &str, parts: &[&str]) -> bool {
     if qn.0 == raw {
         return true;
     }
-    let segments: Vec<&str> = qn.0.split("::").collect();
+    let segments = split_qualified(&qn.0);
     if parts.len() > segments.len() {
         return false;
     }
@@ -163,5 +153,22 @@ mod tests {
             split_file_filter("src/foo.rs:Foo.bar"),
             (Some("src/foo.rs"), "Foo.bar")
         );
+    }
+
+    #[test]
+    fn split_file_filter_ignores_colons_in_escaped_identifier() {
+        assert_eq!(split_file_filter(r#"@"work::later""#), (None, r#"@"work::later""#));
+        assert_eq!(
+            split_file_filter(r#"src/helper.zig:@"work::later""#),
+            (Some("src/helper.zig"), r#"@"work::later""#)
+        );
+    }
+
+    #[test]
+    fn qn_match_preserves_escaped_dots_and_colons() {
+        let qn = Qn::new(r#"helper.zig::@"Type.With-Dash"::@"work::later""#);
+        let dotted = r#"@"Type.With-Dash".@"work::later""#;
+        let parts = split_dotted(dotted);
+        assert!(qn_matches(&qn, dotted, &parts));
     }
 }

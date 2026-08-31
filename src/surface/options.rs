@@ -14,6 +14,7 @@ pub enum LangOverride {
     Python,
     TypeScript,
     Scala,
+    Zig,
     Fallback,
 }
 
@@ -24,6 +25,7 @@ impl LangOverride {
             "python" | "py" => Some(Self::Python),
             "typescript" | "ts" | "javascript" | "js" => Some(Self::TypeScript),
             "scala" => Some(Self::Scala),
+            "zig" => Some(Self::Zig),
             "fallback" | "generic" => Some(Self::Fallback),
             _ => None,
         }
@@ -33,11 +35,10 @@ impl LangOverride {
 #[derive(Debug, Clone)]
 pub struct SurfaceOptions {
     pub output: OutputMode,
-    /// Visibility filter passed through to the fallback resolver.
-    /// Ignored for Rust / Python (they always honour their own
-    /// language semantics).
+    /// Visibility filter passed through to the fallback and Zig resolvers.
+    /// Ignored by resolvers whose package semantics define a fixed public set.
     pub include_private: bool,
-    /// Recursion guard for `pub use` chains and Python re-export hops.
+    /// Recursion guard for language-specific re-export chains.
     pub max_depth: usize,
     /// When emitting flat text, also append the via-chain on each line.
     pub include_chain: bool,

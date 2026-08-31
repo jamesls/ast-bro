@@ -18,6 +18,7 @@
 use half::f16;
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -277,12 +278,18 @@ const PAR_THRESHOLD: usize = 4096;
 /// This matches `bm25.get_scores`'s post-filter-weight semantics — we drop
 /// them entirely rather than zeroing, since 0 may legitimately rank.
 ///
-/// Returns up to `k` `(row_id, score)` pairs sorted by score descending.
-pub fn cosine_topk(
+/// Returns up to `k` `(row_id, score)` pairs sorted by score descending, using
+/// `tie_break` for equal similarities.
+///
+/// Persistent indexes pass a logical chunk comparator because incremental
+/// updates retain tombstones and append replacements, changing row ids without
+/// changing the live corpus.
+pub(crate) fn cosine_topk(
     query: &[f32; DIM],
     embeddings: &[f32],
     mask: Option<&[bool]>,
     k: usize,
+    tie_break: impl Fn(&u32, &u32) -> Ordering,
 ) -> Vec<(u32, f32)> {
     use rayon::prelude::*;
 
@@ -320,14 +327,16 @@ pub fn cosine_topk(
     let take = k.min(n);
     idx.select_nth_unstable_by(take - 1, |&a, &b| {
         scores[b as usize]
-            .partial_cmp(&scores[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&scores[a as usize])
+            .then_with(|| tie_break(&a, &b))
+            .then(a.cmp(&b))
     });
     let mut top: Vec<u32> = idx.into_iter().take(take).collect();
     top.sort_by(|&a, &b| {
         scores[b as usize]
-            .partial_cmp(&scores[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&scores[a as usize])
+            .then_with(|| tie_break(&a, &b))
+            .then(a.cmp(&b))
     });
 
     top.into_iter()
@@ -549,7 +558,7 @@ mod tests {
         let mut query = [0.0f32; DIM];
         query.fill(1.0 / (DIM as f32).sqrt());
 
-        let top = cosine_topk(&query, &rows, None, 10);
+        let top = cosine_topk(&query, &rows, None, 10, u32::cmp);
         let ids: Vec<u32> = top.iter().map(|(i, _)| *i).collect();
         assert!(ids.contains(&0), "the matching row should rank");
         assert!(ids.contains(&1), "even an opposing row is a candidate");
@@ -574,7 +583,7 @@ mod tests {
         let mut query = [0.0f32; DIM];
         query.fill(unit);
 
-        let top = cosine_topk(&query, &rows, None, 3);
+        let top = cosine_topk(&query, &rows, None, 3, u32::cmp);
         let ids: Vec<u32> = top.iter().map(|(i, _)| *i).collect();
         assert_eq!(ids, vec![3, 4, 5], "the three embedded rows, best first");
         assert!(top.iter().all(|(_, s)| s.is_finite()), "every score finite");
@@ -583,14 +592,14 @@ mod tests {
     #[test]
     fn cosine_topk_empty_returns_empty() {
         let q = [0.0f32; DIM];
-        assert!(cosine_topk(&q, &[], None, 5).is_empty());
+        assert!(cosine_topk(&q, &[], None, 5, u32::cmp).is_empty());
     }
 
     #[test]
     fn cosine_topk_zero_k_returns_empty() {
         let q = [0.0f32; DIM];
         let rows = vec![0.0f32; DIM];
-        assert!(cosine_topk(&q, &rows, None, 0).is_empty());
+        assert!(cosine_topk(&q, &rows, None, 0, u32::cmp).is_empty());
     }
 
     #[test]
@@ -602,7 +611,7 @@ mod tests {
         rows.extend(unit(&[-1.0, 0.0, 0.0])); // row 2: opposite
 
         let q: [f32; DIM] = unit(&[1.0, 0.0, 0.0]).try_into().unwrap();
-        let top = cosine_topk(&q, &rows, None, 3);
+        let top = cosine_topk(&q, &rows, None, 3, u32::cmp);
 
         assert_eq!(top.len(), 3);
         assert_eq!(top[0].0, 0);
@@ -622,7 +631,7 @@ mod tests {
             rows.extend(unit(&[mag, 0.1, 0.0]));
         }
         let q: [f32; DIM] = unit(&[1.0, 0.0, 0.0]).try_into().unwrap();
-        let top = cosine_topk(&q, &rows, None, 3);
+        let top = cosine_topk(&q, &rows, None, 3, u32::cmp);
         assert_eq!(top.len(), 3);
         // Top-3 should be rows 0, 1, 2 in order.
         assert_eq!(top[0].0, 0);
@@ -640,7 +649,7 @@ mod tests {
         let q: [f32; DIM] = unit(&[1.0, 0.0, 0.0]).try_into().unwrap();
         // Mask out the top row.
         let mask = vec![false, true, true];
-        let top = cosine_topk(&q, &rows, Some(&mask), 5);
+        let top = cosine_topk(&q, &rows, Some(&mask), 5, u32::cmp);
         // Should return rows 1 and 2 only — row 0 was filtered before scoring.
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].0, 1);
@@ -660,7 +669,7 @@ mod tests {
             rows.extend(unit(&v));
         }
         let q: [f32; DIM] = unit(&[1.0, 0.0, 0.0]).try_into().unwrap();
-        let top = cosine_topk(&q, &rows, None, 5);
+        let top = cosine_topk(&q, &rows, None, 5, u32::cmp);
         assert_eq!(top.len(), 5);
         // Top result should be row 0 (full alignment with q).
         assert_eq!(top[0].0, 0);

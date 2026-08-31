@@ -154,7 +154,7 @@ CacheFile {
 
 The dependency graph is always present. The call graph starts as `None` and `promote_calls` builds and persists it when a symbol query first needs it.
 
-The cache wrapper schema is `ast-bro.graph-index.v2`. The loader treats `ast-bro.graph-index.v1` as a mismatch and performs a cold rebuild. The separate `DepGraph.schema` field still identifies the dependency payload; it does not replace the wrapper version check.
+The cache wrapper schema is `ast-bro.graph-index.v3`. The loader treats older schemas as a mismatch and performs a cold rebuild. Version 3 invalidates partial call graphs created before complete Zig namespace and escaped-identifier resolution. The separate `DepGraph.schema` field still identifies the dependency payload; it does not replace the wrapper version check.
 
 `search::cache::compute_delta` compares the recorded files with the working tree. It uses path membership plus mtime and size checks, and hashes a file when metadata changes. A stale cache goes through `apply_delta_to_deps`. That function removes entries for changed files, rebuilds the suffix index, re-extracts added or modified files, and recomputes dependency statistics. If `UnifiedGraph.calls` is present, `apply_delta_to_calls` patches the symbol graph against the updated dependency graph. A dependency patch failure falls back to a cold build.
 

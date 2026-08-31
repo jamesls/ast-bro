@@ -14,6 +14,8 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::symbol_path::{is_zig_identifier, split_unquoted_separators};
+
 /// Reciprocal Rank Fusion constant. Higher k flattens the curve.
 pub const RRF_K: u32 = 60;
 
@@ -44,7 +46,12 @@ fn symbol_query_re() -> &'static Regex {
 /// identifier (e.g. `HandlerStack`, `_dunder`, `Sinatra::Base`, `app.use`).
 /// Plain lowercase words like `"session"` are treated as natural language.
 pub fn is_symbol_query(query: &str) -> bool {
-    symbol_query_re().is_match(query.trim())
+    let query = query.trim();
+    symbol_query_re().is_match(query)
+        || (query.contains("@\"")
+            && split_unquoted_separators(query, &["::", "\\", "->", "."])
+                .into_iter()
+                .all(is_zig_identifier))
 }
 
 /// Pick the semantic-vs-BM25 blend weight for a given query.
@@ -127,6 +134,8 @@ mod tests {
         assert!(is_symbol_query("app.use"));
         assert!(is_symbol_query("Foo->bar"));
         assert!(is_symbol_query(r"My\Namespace\Class"));
+        assert!(is_symbol_query(r#"@"work::later""#));
+        assert!(is_symbol_query(r#"pkg.@"Type.With-Dash".run"#));
     }
 
     #[test]

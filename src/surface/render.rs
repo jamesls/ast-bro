@@ -3,6 +3,7 @@
 use crate::core::JSON_SCHEMA_SURFACE;
 use crate::surface::entry::SurfaceEntry;
 use crate::surface::options::OutputMode;
+use crate::symbol_path::{last_qualified_separator, last_unquoted_byte};
 use colored::Colorize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -101,21 +102,19 @@ pub fn render_json(entries: &[SurfaceEntry], pretty: bool) -> String {
 }
 
 fn _module_prefix(qpath: &str) -> String {
-    if let Some(i) = qpath.rfind("::") {
-        return qpath[..i].to_string();
-    }
-    if let Some(i) = qpath.rfind('.') {
-        return qpath[..i].to_string();
+    let qualified = last_qualified_separator(qpath).map(|index| (index, 2));
+    let dotted = last_unquoted_byte(qpath, b'.').map(|index| (index, 1));
+    if let Some((index, _)) = [qualified, dotted].into_iter().flatten().max_by_key(|v| v.0) {
+        return qpath[..index].to_string();
     }
     String::new()
 }
 
 fn _leaf(qpath: &str) -> &str {
-    if let Some(i) = qpath.rfind("::") {
-        return &qpath[i + 2..];
-    }
-    if let Some(i) = qpath.rfind('.') {
-        return &qpath[i + 1..];
+    let qualified = last_qualified_separator(qpath).map(|index| (index, 2));
+    let dotted = last_unquoted_byte(qpath, b'.').map(|index| (index, 1));
+    if let Some((index, width)) = [qualified, dotted].into_iter().flatten().max_by_key(|v| v.0) {
+        return &qpath[index + width..];
     }
     qpath
 }

@@ -12,6 +12,7 @@
 use crate::calls::graph::{CallEdge, CallGraph, CallTarget, Confidence, Qn};
 use crate::calls::traverse::CallHit;
 use crate::core::{JSON_SCHEMA_CALLEES, JSON_SCHEMA_CALLERS};
+use crate::symbol_path::{last_qualified_separator, last_unquoted_any};
 use colored::Colorize;
 use serde::Serialize;
 use serde_json::json;
@@ -262,7 +263,7 @@ fn sample_suffix(total: usize, shown: usize) -> String {
 /// Last segment of a user-supplied target (`Type.method` → `method`), for
 /// messages that talk about the name rather than the symbol.
 fn terminal_name(target: &str) -> &str {
-    target.rsplit(['.', ':']).next().unwrap_or(target)
+    last_unquoted_any(target, b".:").map_or(target, |index| &target[index + 1..])
 }
 
 /// Like `render_callers_text` but interleaves type-aware groups
@@ -529,7 +530,7 @@ fn colorize_line(line: u32) -> String {
 /// scope segments between in default colour.
 fn colorize_qn(qn: &Qn) -> String {
     let s = qn.as_str();
-    if let Some(idx) = s.rfind("::") {
+    if let Some(idx) = last_qualified_separator(s) {
         let head = &s[..idx];
         let tail = &s[idx + 2..];
         format!(
@@ -870,3 +871,16 @@ pub fn render_callees_json_extended(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_target_name_preserves_escaped_punctuation() {
+        assert_eq!(terminal_name(r#"@"work::later""#), r#"@"work::later""#);
+        assert_eq!(
+            terminal_name(r#"helper.zig:@"Type.With-Dash".run"#),
+            "run"
+        );
+    }
+}

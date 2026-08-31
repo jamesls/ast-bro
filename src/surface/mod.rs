@@ -9,6 +9,9 @@
 //! - **Python**: starts at `__init__.py`, honours `__all__` when present
 //!   and the leading-underscore convention otherwise, follows
 //!   `from .x import y` / `from .x import *` into sub-packages.
+//! - **Zig**: starts at the selected root module and follows public
+//!   `@import` namespace aliases, declaration aliases, and
+//!   `pub usingnamespace` composition.
 //! - **Java / C# / Go / Kotlin**: visibility-filtered fallback — these
 //!   languages have no real re-export concept, so `digest --no-private`
 //!   IS the public surface.
@@ -28,6 +31,7 @@ pub mod render;
 pub mod rust;
 pub mod scala;
 pub mod typescript;
+pub mod zig;
 
 pub use entry::SurfaceEntry;
 pub use entry_point::{discover, EntryPoint};
@@ -67,6 +71,7 @@ pub fn resolve_entry(
         EntryPoint::PythonPackage { .. } => python::resolve(entry, opts),
         EntryPoint::TsPackage { .. } => typescript::resolve(entry, opts),
         EntryPoint::ScalaPackage { .. } => scala::resolve(entry, opts),
+        EntryPoint::ZigModule { .. } => zig::resolve(entry, opts),
         EntryPoint::Fallback { .. } => fallback::resolve(entry, opts),
     }
 }
