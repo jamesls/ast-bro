@@ -589,18 +589,26 @@ fn _scan_siblings_for_legend(
     has_deprecated: &mut bool,
 ) {
     use DeclarationKind::*;
-    if !*has_overloads {
-        for w in siblings.windows(2) {
-            if w[0].kind == w[1].kind
-                && w[0].name == w[1].name
-                && matches!(w[0].kind, Method | Function | Constructor | Destructor | Operator)
-            {
-                *has_overloads = true;
-                break;
-            }
-        }
-    }
+    let mut previous: Option<&Declaration> = None;
     for d in siblings {
+        // Tests remain in the IR for `map`, `show`, and call-graph analysis,
+        // but digest is an implementation/API summary. In particular, a Zig
+        // test's description is not a callable name and must never produce a
+        // misleading `description()` token or affect the digest legend.
+        if _is_test_declaration(d) {
+            continue;
+        }
+        if !*has_overloads {
+            if let Some(prev) = previous {
+                if prev.kind == d.kind
+                    && prev.name == d.name
+                    && matches!(d.kind, Method | Function | Constructor | Destructor | Operator)
+                {
+                    *has_overloads = true;
+                }
+            }
+            previous = Some(d);
+        }
         if !*has_callable
             && matches!(d.kind, Method | Function | Constructor | Destructor | Operator)
         {
@@ -784,6 +792,9 @@ fn _collect_counts(decls: &[Declaration]) -> std::collections::HashMap<&'static 
 
     let mut stack: Vec<&Declaration> = decls.iter().collect();
     while let Some(d) = stack.pop() {
+        if _is_test_declaration(d) {
+            continue;
+        }
         let k = &d.kind;
         match k {
             Class | Struct | Interface | Record | Enum => *out.get_mut("types").unwrap() += 1,
@@ -1247,6 +1258,9 @@ fn _flatten_free_functions<'a>(
     use DeclarationKind::*;
     let mut out = Vec::new();
     for d in decls {
+        if _is_test_declaration(d) {
+            continue;
+        }
         if d.kind == Namespace {
             // Same private-namespace gate as `_flatten_types`: a private
             // `mod` hides its subtree from the public-only view.
@@ -1273,6 +1287,9 @@ fn _digest_members<'a>(type_decl: &'a Declaration, opts: &DigestOptions) -> Vec<
     use DeclarationKind::*;
     let mut members = Vec::new();
     for c in &type_decl.children {
+        if _is_test_declaration(c) {
+            continue;
+        }
         // Nested types and enum variants via the shared predicate: neither
         // is a member for display or capping purposes (types render as
         // their own flattened entries; variants are never listed here).
@@ -1288,6 +1305,10 @@ fn _digest_members<'a>(type_decl: &'a Declaration, opts: &DigestOptions) -> Vec<
         members.push(c);
     }
     members
+}
+
+fn _is_test_declaration(declaration: &Declaration) -> bool {
+    declaration.native_kind.as_deref() == Some("test")
 }
 
 fn _wrap_tokens(tokens: &[String], width: usize, indent: &str) -> Vec<String> {

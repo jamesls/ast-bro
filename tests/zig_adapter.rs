@@ -172,6 +172,40 @@ fn doc_comments_and_tests_render() {
 }
 
 #[test]
+fn digest_omits_tests_even_when_private_declarations_are_included() {
+    let digest = run_success(&["digest", "--include-private", FIXTURE]);
+
+    assert!(!digest.contains("widget local"), "{digest}");
+    assert!(!digest.contains("launch works"), "{digest}");
+    assert!(digest.contains("5 methods"), "{digest}");
+    assert!(digest.contains("reset()"), "{digest}");
+}
+
+#[test]
+fn test_only_digest_has_no_callable_legend_or_test_local_counts() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = directory.path().join("tests_only.zig");
+    std::fs::write(
+        &fixture,
+        "test \"not a callable\" {\n    const Local = struct {\n        value: u8,\n        fn helper() void {}\n    };\n    _ = Local{ .value = 0 };\n}\n",
+    )
+    .expect("write Zig fixture");
+
+    let digest = run_success(&[
+        "digest",
+        "--include-private",
+        fixture.to_str().expect("UTF-8 fixture path"),
+    ]);
+
+    assert!(!digest.contains("# legend:"), "{digest}");
+    assert!(!digest.contains("not a callable"), "{digest}");
+    assert!(digest.contains("# no declarations"), "{digest}");
+    assert!(!digest.contains(" types"), "{digest}");
+    assert!(!digest.contains(" methods"), "{digest}");
+    assert!(!digest.contains(" fields"), "{digest}");
+}
+
+#[test]
 fn json_identifies_zig_and_clean_fixture_has_no_errors() {
     let value = map_json(FIXTURE);
     assert_eq!(value["schema"], "ast-bro.map.v1");
