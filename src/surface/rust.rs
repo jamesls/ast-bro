@@ -252,6 +252,7 @@ impl SurfaceWalker {
             return;
         }
         self.entries.push(SurfaceEntry {
+            conditional: false,
             qualified_path: qpath,
             kind: decl.kind,
             signature: decl.signature.clone(),
@@ -278,6 +279,7 @@ impl SurfaceWalker {
             return;
         }
         self.entries.push(SurfaceEntry {
+            conditional: false,
             qualified_path: qpath,
             kind: source_decl.kind,
             signature: source_decl.signature.clone(),

@@ -1623,7 +1623,7 @@ test { second(); }
         serde_json::from_str(work_callers.trim()).expect("callers JSON");
     let matches = doc["matches"].as_array().expect("matches");
     assert!(matches.iter().any(|edge| {
-        edge["source"] == "main.zig::test@7"
+        edge["source"] == "main.zig::test@L7C1"
             && edge["target"] == "helper.zig::work"
             && edge["confidence"] == "Exact"
     }));
@@ -1635,7 +1635,7 @@ test { second(); }
     );
     assert_eq!(code, 0, "second callers failed: {second_callers}");
     assert!(
-        second_callers.contains("main.zig::test@11"),
+        second_callers.contains("main.zig::test@L11C1"),
         "the second unnamed test needs its own QN: {second_callers}"
     );
 }
@@ -1662,7 +1662,7 @@ fn zig_field_expression_preserves_qualified_receiver() {
         unattributed.iter().any(|entry| {
             entry["source"] == "main.zig::field_receiver"
                 && entry["callee"] == "print"
-                && entry["receiver"] == "std.debug"
+                && entry["receiver"] == "@import(\"std\").debug"
         }),
         "expected field_expression receiver text `std.debug`, got:\n{out}"
     );
@@ -1709,7 +1709,7 @@ fn zig_test_declaration_owns_its_calls() {
     let matches = doc["matches"].as_array().expect("matches array");
     assert!(
         matches.iter().any(|entry| {
-            entry["source"] == "main.zig::call stays with test owner"
+            entry["source"] == "main.zig::test@L45C1"
                 && entry["target"] == "main.zig::leaf"
                 && entry["confidence"] == "Exact"
         }),

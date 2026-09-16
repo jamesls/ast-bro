@@ -1131,7 +1131,7 @@ fn run_run(args: Value) -> CallResult {
     // Cache compiled patterns per language when lang is auto-detected,
     // so files of the same language reuse the compiled pattern.
     // Stores Result<Pattern, String> — Err when the pattern is invalid for that language.
-    let mut pattern_cache: std::collections::HashMap<ast_grep_language::SupportLang, Result<ast_grep_core::Pattern, String>> = std::collections::HashMap::new();
+    let mut pattern_cache: std::collections::HashMap<crate::run::RunLanguage, Result<ast_grep_core::Pattern, String>> = std::collections::HashMap::new();
 
     for path in &files {
         // Detect language first to avoid reading non-source files.

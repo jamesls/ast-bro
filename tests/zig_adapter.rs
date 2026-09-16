@@ -108,7 +108,10 @@ fn members_nest_under_their_container() {
         "method"
     );
     assert_eq!(
-        find_decl(children, "widget local").expect("local test")["native_kind"],
+        children
+            .iter()
+            .find(|declaration| declaration["signature"] == "test \"widget local\"")
+            .expect("local test")["native_kind"],
         "test"
     );
 }
@@ -224,13 +227,10 @@ fn show_and_implements_use_the_shared_zig_routing() {
 }
 
 #[test]
-fn stale_grammar_errors_do_not_hide_surrounding_declarations() {
+fn current_grammar_accepts_assembly_and_preserves_surrounding_declarations() {
     let value = map_json(STALE_GRAMMAR_FIXTURE);
     let file = &value["files"][0];
-    assert!(
-        file["error_count"].as_u64().is_some_and(|count| count > 0),
-        "the known Zig 0.15 asm gap should be reported: {value}"
-    );
+    assert_eq!(file["error_count"], 0, "{value}");
     let declarations = file_declarations(&value);
     for name in ["before", "stale_asm", "after"] {
         assert!(
@@ -453,7 +453,9 @@ fn typed_anonymous_containers_preserve_all_nested_fields() {
 
     let nested = find_decl(declarations, "top_level_nested").expect("nested inferred shape");
     assert!(find_decl(
-        nested["children"].as_array().expect("nested shape children"),
+        nested["children"]
+            .as_array()
+            .expect("nested shape children"),
         "value"
     )
     .is_some());

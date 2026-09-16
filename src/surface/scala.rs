@@ -74,6 +74,7 @@ pub fn resolve(
             continue;
         }
         out.push(SurfaceEntry {
+            conditional: false,
             qualified_path: k.clone(),
             kind: d.kind,
             signature: d.signature.clone(),
@@ -132,6 +133,7 @@ pub fn resolve(
                                     break;
                                 }
                                 out.push(SurfaceEntry {
+            conditional: false,
                                     qualified_path: local_q,
                                     kind: d.kind,
                                     signature: d.signature.clone(),
@@ -168,6 +170,7 @@ pub fn resolve(
                             };
                             if seen.insert(local_q.clone()) {
                                 out.push(SurfaceEntry {
+            conditional: false,
                                     qualified_path: local_q,
                                     kind: d.kind,
                                     signature: d.signature.clone(),

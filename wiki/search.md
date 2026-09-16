@@ -393,7 +393,7 @@ layout of `chunks.bin`. A v1 index cannot be decoded, so the loader rejects it
 outright, including the pre-rename `ast-outline.*` names. The caller rebuilds
 the index because it is a cache; the format has no migration path.
 
-Schema v3 keeps the same binary layout but changes Zig from plain-text chunks
+Schema v3 kept the same binary layout but changed Zig from plain-text chunks
 to declaration-aware chunks. Rejecting v2 ensures an unchanged Zig file is
 re-chunked instead of preserving stale cache entries during a delta update.
 
@@ -461,3 +461,6 @@ queries describe behavior over a real codebase.
 
 The `AST_OUTLINE_MODEL_SOURCE` environment variable lets operators specify a
 custom HF-compatible mirror without code changes.
+
+Schema v4 rebuilds Zig chunks with the corrected 0.16 grammar and includes members
+of containers returned by generic factories. ZON files use plain-text chunks.

@@ -379,6 +379,7 @@ fn zig_cycle_is_detected() {
 fn zig_edit_invalidates_the_dependency_cache() {
     let tmp = tempfile::tempdir().expect("temporary Zig project");
     let root = tmp.path();
+    std::fs::create_dir(root.join(".git")).expect("isolate the fixture's graph cache");
     std::fs::write(root.join("a.zig"), "pub const value = 1;\n").expect("write a.zig");
     std::fs::write(root.join("b.zig"), "pub const value = 22;\n").expect("write b.zig");
     std::fs::write(

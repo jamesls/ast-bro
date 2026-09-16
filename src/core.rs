@@ -29,7 +29,8 @@ pub const JSON_SCHEMA_RUN: &str = "ast-bro.run.v1";
 /// one clean rebuild after Zig extraction and resolution gained namespace
 /// aliases, `usingnamespace`, visibility enforcement, and escaped identifiers;
 /// otherwise an unchanged project could retain the partial v2 call graph.
-pub const JSON_SCHEMA_GRAPH_INDEX: &str = "ast-bro.graph-index.v3";
+/// v4 refreshes the Zig grammar, lexical bindings, and inline test identities.
+pub const JSON_SCHEMA_GRAPH_INDEX: &str = "ast-bro.graph-index.v4";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Default)]
 pub enum DeclarationKind {
@@ -1418,6 +1419,8 @@ fn _trail_matches(trail: &[String], parts: &[&str], substring: bool) -> bool {
             segment.to_lowercase().contains(&p.to_lowercase())
         } else {
             segment == p
+                || ((segment.starts_with("@\"") || p.starts_with("@\""))
+                    && crate::zig_syntax::identifier(segment) == crate::zig_syntax::identifier(p))
         };
         if !hit {
             return false;

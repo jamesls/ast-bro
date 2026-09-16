@@ -26,6 +26,7 @@ mod show;
 mod squeeze;
 mod surface;
 mod symbol_path;
+mod zig_syntax;
 
 use crate::core::{DigestOptions, MapOptions, ParseResult};
 
@@ -895,7 +896,9 @@ fn exit_with_parse_error(e: clap::Error) -> ! {
     // `--json=true` never parses (the flag takes no value), but the
     // rejection it triggers should still carry the envelope the caller was
     // plainly asking for — hence the prefix form beside the exact match.
-    let json_mode = raw.iter().any(|a| a == "--json" || a.starts_with("--json="));
+    let json_mode = raw
+        .iter()
+        .any(|a| a == "--json" || a.starts_with("--json="));
     let cmd = Cli::command();
     // Match the real subcommand list rather than "first token that isn't a
     // flag": a flag *value* sits in the same position a subcommand would
@@ -1447,9 +1450,7 @@ pub fn run() {
                     CliErrorKind::PathNotFound,
                     format!("path not found: {}", path.display()),
                 );
-                if let Some(h) =
-                    crate::path_repair::hints(&[path.to_string_lossy().into_owned()])
-                {
+                if let Some(h) = crate::path_repair::hints(&[path.to_string_lossy().into_owned()]) {
                     err = err.hint(h);
                 }
                 err.exit(*json);

@@ -38,6 +38,9 @@ pub fn render_flat(entries: &[SurfaceEntry], include_chain: bool) -> String {
         if e.via_glob {
             out.push_str(&format!("  {}", "[via *]".cyan()));
         }
+        if e.conditional {
+            out.push_str(&format!("  {}", "[conditional]".cyan()));
+        }
         if include_chain && !e.re_export_chain.is_empty() {
             let chain_text: Vec<String> = e
                 .re_export_chain

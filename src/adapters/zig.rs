@@ -4,6 +4,8 @@
 //! walks `tree_sitter::Node`s and produces the same declaration IR as the
 //! ast-grep-backed adapters.
 
+mod calls;
+
 use super::base::collapse_ws;
 use crate::core::{CallKind, CallSite, Declaration, DeclarationKind, ImportBinding, ParseResult};
 use std::collections::HashMap;
@@ -21,7 +23,7 @@ enum ContainerKind {
 pub fn parse_zig(path: &Path, source: &[u8]) -> ParseResult {
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(&tree_sitter_zig::LANGUAGE.into())
+        .set_language(&crate::zig_syntax::LANGUAGE.into())
         .expect("the bundled Zig grammar must load");
     let tree = parser
         .parse(source, None)
@@ -29,6 +31,7 @@ pub fn parse_zig(path: &Path, source: &[u8]) -> ParseResult {
     let root = tree.root_node();
     let mut declarations = Vec::new();
     walk_container(root, source, ContainerKind::Root, &mut declarations);
+    calls::populate(&mut declarations, root, source);
     let imports = extract_import_bindings(root, source);
 
     ParseResult {
@@ -140,7 +143,7 @@ fn function_to_decl(node: Node<'_>, source: &[u8], is_method: bool) -> Option<De
     .trim()
     .to_string();
 
-    let mut declaration = make_declaration(
+    let declaration = make_declaration(
         node,
         source,
         if is_method {
@@ -154,9 +157,7 @@ fn function_to_decl(node: Node<'_>, source: &[u8], is_method: bool) -> Option<De
         node.child_by_field_name("body")
             .map_or_else(Vec::new, |body| extract_local_declarations(body, source)),
     );
-    declaration.calls = node
-        .child_by_field_name("body")
-        .map_or_else(Vec::new, |body| extract_call_sites(body, source));
+
     Some(declaration)
 }
 
@@ -197,30 +198,19 @@ fn container_field_to_decl(
 }
 
 fn test_to_decl(node: Node<'_>, source: &[u8]) -> Option<Declaration> {
-    let mut cursor = node.walk();
-    let name_node = node
-        .named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "string" | "identifier"));
-    let name = name_node
-        .map(|child| {
-            let text = node_text(child, source).trim();
-            if child.kind() == "string" {
-                text.strip_prefix('"')
-                    .and_then(|text| text.strip_suffix('"'))
-                    .unwrap_or(text)
-                    .to_string()
-            } else {
-                text.to_string()
-            }
-        })
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("test@{}", node.start_position().row + 1));
+    // Tests inhabit a separate compiler namespace, even doctests named after
+    // an existing function. Their signature retains the original description.
+    let name = format!(
+        "test@L{}C{}",
+        node.start_position().row + 1,
+        node.start_position().column + 1
+    );
     let body = first_named_child_of_kind(node, "block")?;
     let signature = collapse_ws(&String::from_utf8_lossy(
         &source[node.start_byte()..body.start_byte()],
     ));
 
-    let mut declaration = make_declaration(
+    let declaration = make_declaration(
         node,
         source,
         DeclarationKind::Function,
@@ -229,7 +219,7 @@ fn test_to_decl(node: Node<'_>, source: &[u8]) -> Option<Declaration> {
         Some("test".to_string()),
         extract_local_declarations(body, source),
     );
-    declaration.calls = extract_call_sites(body, source);
+
     Some(declaration)
 }
 
@@ -352,7 +342,7 @@ fn comptime_to_decl(node: Node<'_>, source: &[u8]) -> Option<Declaration> {
         collapsed_node_text(node, source, &[';'])
     };
 
-    let mut declaration = make_declaration(
+    let declaration = make_declaration(
         node,
         source,
         DeclarationKind::Function,
@@ -361,7 +351,7 @@ fn comptime_to_decl(node: Node<'_>, source: &[u8]) -> Option<Declaration> {
         Some("comptime".to_string()),
         extract_local_declarations(body, source),
     );
-    declaration.calls = extract_call_sites(body, source);
+
     Some(declaration)
 }
 
@@ -382,429 +372,6 @@ fn usingnamespace_to_decl(node: Node<'_>, source: &[u8]) -> Option<Declaration> 
         Some("usingnamespace".to_string()),
         Vec::new(),
     ))
-}
-
-fn extract_call_sites(body: Node<'_>, source: &[u8]) -> Vec<CallSite> {
-    let mut calls = Vec::new();
-    walk_calls_in_body(body, source, &mut calls);
-    rewrite_typed_receivers(body, source, &mut calls);
-    rewrite_local_import_calls(body, source, &mut calls);
-    calls
-}
-
-#[derive(Clone)]
-struct ScopedType {
-    local: String,
-    type_name: String,
-    line: u32,
-    end_line: u32,
-}
-
-fn rewrite_typed_receivers(body: Node<'_>, source: &[u8], calls: &mut [CallSite]) {
-    let types = local_types(body, source);
-    for call in calls {
-        let Some(receiver) = call.receiver.as_deref() else {
-            continue;
-        };
-        let Some(mut members) = dotted_identifiers(receiver) else {
-            continue;
-        };
-        let local = members.remove(0);
-        if matches!(local, "self" | "Self") {
-            continue;
-        }
-        let Some(binding) = types
-            .iter()
-            .filter(|binding| {
-                binding.local == local && binding.line <= call.line && call.line <= binding.end_line
-            })
-            .max_by_key(|binding| binding.line)
-        else {
-            continue;
-        };
-        let mut receiver = binding.type_name.clone();
-        for member in members {
-            receiver.push('.');
-            receiver.push_str(member);
-        }
-        call.receiver = Some(receiver);
-    }
-}
-
-fn local_types(body: Node<'_>, source: &[u8]) -> Vec<ScopedType> {
-    let end_line = body.end_position().row as u32 + 1;
-    let mut types = Vec::new();
-
-    if let Some(owner) = body.parent() {
-        let mut cursor = owner.walk();
-        if let Some(parameters) = owner
-            .named_children(&mut cursor)
-            .find(|child| child.kind() == "parameters")
-        {
-            let mut parameter_cursor = parameters.walk();
-            for parameter in parameters.named_children(&mut parameter_cursor) {
-                let (Some(name), Some(value_type)) = (
-                    parameter.child_by_field_name("name"),
-                    parameter.child_by_field_name("type"),
-                ) else {
-                    continue;
-                };
-                let Some(type_name) = callable_receiver_type(value_type, source) else {
-                    continue;
-                };
-                types.push(ScopedType {
-                    local: node_text(name, source).trim().to_string(),
-                    type_name,
-                    line: 0,
-                    end_line,
-                });
-            }
-        };
-    }
-
-    let mut variables = Vec::new();
-    collect_local_variables(body, end_line, &mut variables);
-    variables.sort_by_key(|(node, _)| node.start_byte());
-    for (variable, scope_end) in variables {
-        let Some(name) = first_named_child_of_kind(variable, "identifier") else {
-            continue;
-        };
-        let value_type = variable
-            .child_by_field_name("type")
-            .or_else(|| initializer_after_equals(variable));
-        let Some(type_name) = value_type.and_then(|node| callable_receiver_type(node, source))
-        else {
-            continue;
-        };
-        types.push(ScopedType {
-            local: node_text(name, source).trim().to_string(),
-            type_name,
-            line: variable.start_position().row as u32 + 1,
-            end_line: scope_end,
-        });
-    }
-    types
-}
-
-fn callable_receiver_type(node: Node<'_>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" => {
-            let name = node_text(node, source).trim();
-            name.bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_uppercase())
-                .then(|| name.to_string())
-        }
-        "field_expression" => {
-            let name = qualified_type_path(node, source)?;
-            dotted_identifiers(&name).is_some().then_some(name)
-        }
-        "struct_initializer" => {
-            let mut cursor = node.walk();
-            let value_type = node.named_children(&mut cursor).next()?;
-            callable_receiver_type(value_type, source)
-        }
-        "type_expression"
-        | "primary_type_expression"
-        | "nullable_type"
-        | "pointer_type"
-        | "slice_type"
-        | "array_type"
-        | "error_union_type"
-        | "parenthesized_expression" => {
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            children
-                .into_iter()
-                .rev()
-                .find_map(|child| callable_receiver_type(child, source))
-        }
-        _ => None,
-    }
-}
-
-fn qualified_type_path(node: Node<'_>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" => {
-            let name = node_text(node, source).trim();
-            is_identifier(name).then(|| name.to_string())
-        }
-        "field_expression" => {
-            let object = qualified_type_path(node.child_by_field_name("object")?, source)?;
-            let member = node_text(node.child_by_field_name("member")?, source).trim();
-            if !is_identifier(member) {
-                return None;
-            }
-            Some(format!("{object}.{member}"))
-        }
-        "type_expression"
-        | "primary_type_expression"
-        | "nullable_type"
-        | "pointer_type"
-        | "slice_type"
-        | "array_type"
-        | "error_union_type"
-        | "parenthesized_expression" => {
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-            children
-                .into_iter()
-                .rev()
-                .find_map(|child| qualified_type_path(child, source))
-        }
-        _ => None,
-    }
-}
-
-#[derive(Clone)]
-struct ScopedImport {
-    binding: ImportBinding,
-    end_line: u32,
-}
-
-fn rewrite_local_import_calls(body: Node<'_>, source: &[u8], calls: &mut [CallSite]) {
-    let imports = local_imports(body, source);
-    for call in calls {
-        if let Some(receiver) = call.receiver.as_deref() {
-            let Some(mut members) = dotted_identifiers(receiver) else {
-                continue;
-            };
-            let local = members.remove(0);
-            let Some(import) = visible_import(&imports, local, call.line) else {
-                continue;
-            };
-            let mut path = import.binding.member_path.clone();
-            path.extend(members.into_iter().map(str::to_string));
-            call.receiver = Some(inline_import_receiver(&import.binding.module, &path));
-            continue;
-        }
-
-        // A callable itself may be aliased: `const run = module.run; run()`.
-        let Some(import) = visible_import(&imports, &call.name, call.line) else {
-            continue;
-        };
-        let Some(callable) = import.binding.member_path.last().cloned() else {
-            continue;
-        };
-        let scope = &import.binding.member_path[..import.binding.member_path.len() - 1];
-        call.name = callable;
-        call.receiver = Some(inline_import_receiver(&import.binding.module, scope));
-    }
-}
-
-fn local_imports(body: Node<'_>, source: &[u8]) -> Vec<ScopedImport> {
-    let mut nodes = Vec::new();
-    collect_local_variables(
-        body,
-        body.end_position().row as u32 + 1,
-        &mut nodes,
-    );
-    nodes.sort_by_key(|(node, _)| node.start_byte());
-
-    let mut resolved = Vec::<ScopedImport>::new();
-    for (node, end_line) in nodes {
-        if declaration_keyword(node, source) != Some("const") {
-            continue;
-        }
-        let Some(local_node) = first_named_child_of_kind(node, "identifier") else {
-            continue;
-        };
-        let local = node_text(local_node, source).trim();
-        if local.is_empty() {
-            continue;
-        }
-        let line = node.start_position().row as u32 + 1;
-        let visible = resolved
-            .iter()
-            .filter(|import| import.binding.line <= line && line <= import.end_line)
-            .map(|import| (import.binding.local.clone(), import.binding.clone()))
-            .collect::<HashMap<_, _>>();
-        let Some(initializer) = initializer_after_equals(node) else {
-            continue;
-        };
-        let Some((module, member_path)) = import_value(initializer, source, &visible) else {
-            continue;
-        };
-        resolved.push(ScopedImport {
-            binding: ImportBinding {
-                local: local.to_string(),
-                module,
-                member_path,
-                line,
-            },
-            end_line,
-        });
-    }
-    resolved
-}
-
-fn collect_local_variables<'tree>(
-    node: Node<'tree>,
-    scope_end_line: u32,
-    nodes: &mut Vec<(Node<'tree>, u32)>,
-) {
-    if matches!(
-        node.kind(),
-        "function_declaration" | "test_declaration" | "comptime_declaration" | "comptime_statement"
-    ) || is_container_kind(node.kind())
-    {
-        return;
-    }
-
-    let scope_end_line = if node.kind() == "block" {
-        node.end_position().row as u32 + 1
-    } else {
-        scope_end_line
-    };
-    if node.kind() == "variable_declaration" {
-        nodes.push((node, scope_end_line));
-        if initializer_container(node).is_some() {
-            return;
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_local_variables(child, scope_end_line, nodes);
-    }
-}
-
-fn visible_import<'a>(imports: &'a [ScopedImport], local: &str, line: u32) -> Option<&'a ScopedImport> {
-    imports
-        .iter()
-        .filter(|import| {
-            import.binding.local == local
-                && import.binding.line <= line
-                && line <= import.end_line
-        })
-        .max_by_key(|import| import.binding.line)
-}
-
-fn dotted_identifiers(value: &str) -> Option<Vec<&str>> {
-    let mut members = Vec::new();
-    let bytes = value.as_bytes();
-    let mut start = 0usize;
-    let mut in_escaped_identifier = false;
-    let mut escaped = false;
-    for (index, &byte) in bytes.iter().enumerate() {
-        if in_escaped_identifier {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_escaped_identifier = false;
-            }
-            continue;
-        }
-        if byte == b'"' && index > start && bytes[index - 1] == b'@' {
-            in_escaped_identifier = true;
-        } else if byte == b'.' {
-            members.push(value[start..index].trim());
-            start = index + 1;
-        }
-    }
-    if in_escaped_identifier || escaped {
-        return None;
-    }
-    members.push(value[start..].trim());
-    (!members.is_empty() && members.iter().all(|member| is_identifier(member))).then_some(members)
-}
-
-fn inline_import_receiver(module: &str, members: &[String]) -> String {
-    let mut receiver = format!("@import(\"{module}\")");
-    for member in members {
-        receiver.push('.');
-        receiver.push_str(member);
-    }
-    receiver
-}
-
-fn walk_calls_in_body(node: Node<'_>, source: &[u8], calls: &mut Vec<CallSite>) {
-    if matches!(node.kind(), "function_declaration" | "test_declaration")
-        || matches!(node.kind(), "comptime_declaration" | "comptime_statement")
-        || is_container_kind(node.kind())
-    {
-        return;
-    }
-
-    let call = match node.kind() {
-        "call_expression" => call_site_from_call(node, source),
-        "builtin_function" => call_site_from_builtin(node, source),
-        "struct_initializer" => call_site_from_struct_initializer(node, source),
-        _ => None,
-    };
-    if let Some(call) = call {
-        calls.push(call);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk_calls_in_body(child, source, calls);
-    }
-}
-
-fn call_site_from_call(node: Node<'_>, source: &[u8]) -> Option<CallSite> {
-    let function = node.child_by_field_name("function")?;
-    let (name, receiver) = split_callee(function, source)?;
-    Some(CallSite {
-        name,
-        receiver,
-        line: node.start_position().row as u32 + 1,
-        kind: CallKind::Call,
-    })
-}
-
-fn call_site_from_builtin(node: Node<'_>, source: &[u8]) -> Option<CallSite> {
-    let builtin = first_named_child_of_kind(node, "builtin_identifier")?;
-    let name = node_text(builtin, source).trim();
-    if name.is_empty() || name == "@import" {
-        // `@import` establishes a compile-time module dependency. Zig import
-        // bindings are recorded separately in `ParseResult::imports`; adding
-        // an external runtime call as well would duplicate that relationship
-        // and make every importing callable report a noisy `@import` callee.
-        return None;
-    }
-    Some(CallSite {
-        name: name.to_string(),
-        receiver: None,
-        line: node.start_position().row as u32 + 1,
-        kind: CallKind::Call,
-    })
-}
-
-fn call_site_from_struct_initializer(node: Node<'_>, source: &[u8]) -> Option<CallSite> {
-    let mut cursor = node.walk();
-    let type_node = node.named_children(&mut cursor).next()?;
-    let (name, receiver) = split_callee(type_node, source)?;
-    Some(CallSite {
-        name,
-        receiver,
-        line: node.start_position().row as u32 + 1,
-        kind: CallKind::Construct,
-    })
-}
-
-fn split_callee(node: Node<'_>, source: &[u8]) -> Option<(String, Option<String>)> {
-    match node.kind() {
-        "identifier" => {
-            let name = node_text(node, source).to_string();
-            (!name.is_empty()).then_some((name, None))
-        }
-        "field_expression" => {
-            let object = node.child_by_field_name("object")?;
-            let member = node.child_by_field_name("member")?;
-            let name = node_text(member, source).to_string();
-            let receiver = node_text(object, source).to_string();
-            (!name.is_empty() && !receiver.is_empty()).then_some((name, Some(receiver)))
-        }
-        // A builtin used directly as a callee is represented by a
-        // `builtin_function`, not a `call_expression`, and is handled by
-        // `call_site_from_builtin`. Other expression-shaped callees stay
-        // unresolved rather than manufacturing a misleading symbol name.
-        "builtin_function" => None,
-        _ => None,
-    }
 }
 
 fn extract_import_bindings(root: Node<'_>, source: &[u8]) -> Vec<ImportBinding> {
@@ -903,18 +470,11 @@ fn import_module(node: Node<'_>, source: &[u8]) -> Option<String> {
     let arguments = first_named_child_of_kind(node, "arguments")?;
     let string = first_named_child_of_kind(arguments, "string")?;
     let raw_string = node_text(string, source);
-    let raw_spec = raw_string.strip_prefix('"')?.strip_suffix('"')?;
+    let raw_spec = crate::zig_syntax::string_value(raw_string)?;
     if raw_spec.is_empty() {
         return None;
     }
-    Some(if raw_spec.ends_with(".zig")
-        && !raw_spec.starts_with("./")
-        && !raw_spec.starts_with("../")
-    {
-        format!("./{raw_spec}")
-    } else {
-        raw_spec.to_string()
-    })
+    Some(crate::zig_syntax::import_spec(&raw_spec))
 }
 
 fn initializer_after_equals(node: Node<'_>) -> Option<Node<'_>> {
@@ -923,7 +483,7 @@ fn initializer_after_equals(node: Node<'_>) -> Option<Node<'_>> {
     for child in node.children(&mut cursor) {
         if child.kind() == "=" {
             after_equals = true;
-        } else if after_equals && child.is_named() {
+        } else if after_equals && child.is_named() && child.kind() != "comment" {
             return Some(child);
         }
     }
@@ -1368,12 +928,12 @@ test "direct calls" { leaf(); }
         assert_eq!(
             calls,
             vec![
-                ("leaf", None, CallKind::Call),
+                ("leaf", Some("@This()"), CallKind::Call),
                 ("print", Some("std.debug"), CallKind::Call),
                 ("Point", Some("geom"), CallKind::Construct),
                 ("Widget", None, CallKind::Construct),
                 ("@as", None, CallKind::Call),
-                ("helper", None, CallKind::Call),
+                ("helper", Some("@This()"), CallKind::Call),
             ]
         );
         assert!(outer.calls.iter().all(|call| call.name != "hidden"));
@@ -1382,7 +942,7 @@ test "direct calls" { leaf(); }
         assert_eq!(nested.calls.len(), 1);
         assert_eq!(nested.calls[0].name, "hidden");
 
-        let test = declaration_named(&parsed.declarations, "direct calls");
+        let test = declaration_named(&parsed.declarations, "test@L13C1");
         assert_eq!(test.calls.len(), 1);
         assert_eq!(test.calls[0].name, "leaf");
     }
@@ -1400,7 +960,7 @@ pub fn typed(value: *helper.@"Type.With-Dash") void {
         assert_eq!(typed.calls[0].name, "ping");
         assert_eq!(
             typed.calls[0].receiver.as_deref(),
-            Some("helper.@\"Type.With-Dash\"")
+            Some("@import(\"./helper.zig\").@\"Type.With-Dash\"")
         );
     }
 
@@ -1474,22 +1034,31 @@ test {
 "#;
         let parsed = parse_zig(Path::new("local-imports.zig"), source);
         let unrelated = declaration_named(&parsed.declarations, "unrelated");
-        assert_eq!(unrelated.calls[0].receiver.as_deref(), Some("format"));
+        assert_eq!(unrelated.calls[0].receiver.as_deref(), Some("?.format"));
 
-        let test = declaration_named(&parsed.declarations, "test@4");
-        assert_eq!(test.calls[0].receiver.as_deref(), Some("@import(\"./helper.zig\")"));
+        let test = declaration_named(&parsed.declarations, "test@L4C1");
+        assert_eq!(
+            test.calls[0].receiver.as_deref(),
+            Some("@import(\"./helper.zig\")")
+        );
         assert_eq!(test.calls[0].name, "work");
-        assert_eq!(test.calls[1].receiver.as_deref(), Some("@import(\"./helper.zig\")"));
+        assert_eq!(
+            test.calls[1].receiver.as_deref(),
+            Some("@import(\"./helper.zig\")")
+        );
         assert_eq!(test.calls[1].name, "run");
-        assert!(parsed.imports.is_empty(), "local imports must not become file bindings");
+        assert!(
+            parsed.imports.is_empty(),
+            "local imports must not become file bindings"
+        );
     }
 
     #[test]
     fn unnamed_tests_have_unique_names() {
         let source = b"test { first(); }\n\ntest { second(); }\n";
         let parsed = parse_zig(Path::new("tests.zig"), source);
-        let first = declaration_named(&parsed.declarations, "test@1");
-        let second = declaration_named(&parsed.declarations, "test@3");
+        let first = declaration_named(&parsed.declarations, "test@L1C1");
+        let second = declaration_named(&parsed.declarations, "test@L3C1");
         assert_eq!(first.calls[0].name, "first");
         assert_eq!(second.calls[0].name, "second");
     }

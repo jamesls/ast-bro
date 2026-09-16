@@ -13,6 +13,9 @@ pub struct ReExportHop {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SurfaceEntry {
+    /// A possible definition selected by an unevaluated build condition.
+    #[serde(skip_serializing_if = "_is_false")]
+    pub conditional: bool,
     /// Fully qualified name as a downstream user would write it
     /// (e.g. `mycrate::net::Client`, `mypkg.public_fn`).
     pub qualified_path: String,

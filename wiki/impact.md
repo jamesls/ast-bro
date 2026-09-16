@@ -7,7 +7,7 @@ and test-file detection into a single structured report.
 ## What it answers
 
 - **What would break if I change this?** — callers + file reverse-deps + file deps, grouped by section.
-- **Which tests exercise this?** — filters the callers list to test files (using the same test-file heuristics as `--tests` / `--exclude-tests`).
+- **Which tests exercise this?** Filters callers using file-name heuristics and Zig inline test identities, including helpers nested in test blocks.
 - **What does it touch internally?** — callees + file deps.
 - **How far does the change propagate?** — transitive callers at configurable depth.
 

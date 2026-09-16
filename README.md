@@ -87,7 +87,7 @@ The agent gets the same structural information with fewer tokens and round-trips
 | Zig        | `.zig` |
 | Markdown   | `.md`, `.markdown`, `.mdx`, `.mdown` |
 
-This table lists the 15 shape-command adapters. The dependency and call graphs cover the 13 source-code languages; SQL and Markdown do not emit graph edges. `run` accepts only languages provided by ast-grep, so Zig, SQL, and Markdown are unavailable for structural search and rewrite.
+This table lists the 15 shape-command adapters. The dependency and call graphs cover the 13 source-code languages; SQL and Markdown do not emit graph edges. `run` supports ast-grep languages plus the bundled Zig grammar. SQL and Markdown remain unavailable for structural search and rewrite. See [Zig support](wiki/zig.md) for syntax coverage and static analysis limits.
 
 Adding another `ast-grep` language starts with a new adapter file. Languages outside `ast-grep` also need native parser routing; see the [architecture guide](wiki/architecture.md#adding-a-new-language).
 
@@ -664,7 +664,7 @@ Resolution is per-language but shares one suffix-index resolver:
 - **C++**: resolves quoted `#include` paths relative to the importer and leaves system headers external.
 - **PHP**: resolves namespace imports through Composer PSR-4 mappings, suffix lookup, and a class-name fallback. Literal `include` / `require` paths resolve relative to the importer.
 - **Ruby**: resolves literal `require_relative` calls and leaves `$LOAD_PATH` or gem imports external.
-- **Zig**: resolves literal `.zig` paths in `@import` relative to the importer. Named modules such as `std` stay external because resolving them requires evaluating `build.zig`.
+- **Zig**: resolves literal `.zig` and `.zon` imports relative to the importer, plus unambiguous literal module wiring in `build.zig`. Generated modules and external libraries such as `std` remain unresolved.
 
 The four commands are also exposed as MCP tools for agents. For internals (suffix index, Tarjan SCC, per-file invalidation, find-related dep boost) see the [deps wiki page](https://github.com/aeroxy/ast-bro/blob/main/wiki/deps.md) on GitHub.
 

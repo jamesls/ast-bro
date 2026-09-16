@@ -27,8 +27,7 @@ use crate::deps::traverse;
 use crate::deps::DepGraph;
 use crate::surface::zig::PublicLookup;
 use crate::symbol_path::{
-    first_qualified_separator, is_zig_identifier, last_qualified_separator,
-    namespace_to_qualified,
+    first_qualified_separator, is_zig_identifier, last_qualified_separator, namespace_to_qualified,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -46,6 +45,7 @@ enum ZigNamespaceResolution {
     Resolved(Qn),
     /// The receiver is an import namespace, but its path or callable is absent.
     Unresolved,
+    Candidates(Vec<Qn>),
 }
 
 /// Resolves Zig namespace receivers through local import bindings and the
@@ -101,15 +101,25 @@ impl<'a> ZigNamespaceResolver<'a> {
         bare_name: &str,
     ) -> ZigNamespaceResolution {
         let receiver = receiver.trim();
+        if receiver == "@This()" || receiver.starts_with("@This().") {
+            let mut members = receiver
+                .strip_prefix("@This().")
+                .map(|path| {
+                    crate::symbol_path::split_dotted(path)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            members.push(bare_name.to_string());
+            return self.namespace_targets(from_file, &members, true);
+        }
         let (target_file, mut members) = if receiver.starts_with("@import") {
             if let Some((spec, members)) = parse_zig_inline_import(receiver) {
-                let Some(target) = self.resolve_spec(from_file, spec) else {
+                let Some(target) = self.resolve_spec(from_file, &spec) else {
                     return ZigNamespaceResolution::Unresolved;
                 };
-                (
-                    target,
-                    members.into_iter().map(str::to_string).collect::<Vec<_>>(),
-                )
+                (target, members)
             } else {
                 return ZigNamespaceResolution::Unresolved;
             }
@@ -130,19 +140,11 @@ impl<'a> ZigNamespaceResolver<'a> {
             (target, pending)
         };
         members.push(bare_name.to_string());
-        let target = self.exact_public_target(&target_file, &members);
-        target.map_or(
-            ZigNamespaceResolution::Unresolved,
-            ZigNamespaceResolution::Resolved,
-        )
+        self.namespace_targets(&target_file, &members, false)
     }
 
     /// Resolve `const local = imported.path.toCallable; local()` aliases.
-    fn resolve_callable_alias(
-        &mut self,
-        from_file: &Path,
-        local: &str,
-    ) -> ZigNamespaceResolution {
+    fn resolve_callable_alias(&mut self, from_file: &Path, local: &str) -> ZigNamespaceResolution {
         let Some((target_file, members)) = self.resolve_binding(from_file, local) else {
             return if self.has_binding(from_file, local) {
                 ZigNamespaceResolution::Unresolved
@@ -172,8 +174,7 @@ impl<'a> ZigNamespaceResolver<'a> {
         let binding = self
             .pass_imports
             .get(&file)
-            .and_then(|bindings| bindings.get(local))
-            ?;
+            .and_then(|bindings| bindings.get(local))?;
         self.resolve_spec(from_file, &binding.module)
             .map(|target| (target, binding.member_path.clone()))
     }
@@ -200,11 +201,51 @@ impl<'a> ZigNamespaceResolver<'a> {
             .find(|candidate| candidate.as_str() == wanted)
             .cloned()
     }
+
+    fn namespace_targets(
+        &mut self,
+        file: &Path,
+        path: &[String],
+        local: bool,
+    ) -> ZigNamespaceResolution {
+        if local {
+            if let Some(name) = path.last() {
+                let wanted = format!("{}::{}", file_rel(self.root, file), path.join("::"));
+                if let Some(target) = self.symbol_table.get(name).and_then(|candidates| {
+                    candidates.iter().find(|candidate| candidate.0 == wanted)
+                }) {
+                    return ZigNamespaceResolution::Resolved(target.clone());
+                }
+            }
+        }
+        let candidates = self
+            .public_lookup
+            .candidates(file, path, local)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|target| {
+                let name = target.path.last()?;
+                let wanted = format!(
+                    "{}::{}",
+                    file_rel(self.root, &target.file),
+                    target.path.join("::")
+                );
+                self.symbol_table
+                    .get(name)?
+                    .iter()
+                    .find(|candidate| candidate.0 == wanted)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        match candidates.len() {
+            0 => ZigNamespaceResolution::Unresolved,
+            1 => ZigNamespaceResolution::Resolved(candidates[0].clone()),
+            _ => ZigNamespaceResolution::Candidates(candidates),
+        }
+    }
 }
 
-fn binding_map(
-    bindings: impl Iterator<Item = ImportBinding>,
-) -> HashMap<String, ImportBinding> {
+fn binding_map(bindings: impl Iterator<Item = ImportBinding>) -> HashMap<String, ImportBinding> {
     bindings
         .filter(|binding| !binding.local.is_empty())
         .map(|binding| (binding.local.clone(), binding))
@@ -248,30 +289,39 @@ fn zig_namespace_members(receiver: &str) -> Option<Vec<&str>> {
 }
 
 /// Parse `@import("file.zig")` and optional namespace members after it.
-fn parse_zig_inline_import(receiver: &str) -> Option<(&str, Vec<&str>)> {
-    let rest = receiver.strip_prefix("@import")?.trim_start();
-    let rest = rest.strip_prefix('(')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let quote = rest.find('"')?;
-    let spec = &rest[..quote];
-    if spec.is_empty() || spec.contains('\\') {
-        return None;
-    }
-    let rest = rest[quote + 1..].trim_start();
-    let rest = rest.strip_prefix(')')?.trim();
-    if rest.is_empty() {
-        return Some((spec, Vec::new()));
-    }
-    let members = zig_namespace_members(rest.strip_prefix('.')?)?;
+fn parse_zig_inline_import(receiver: &str) -> Option<(String, Vec<String>)> {
+    let rest = receiver
+        .strip_prefix("@import")?
+        .trim_start()
+        .strip_prefix('(')?
+        .trim_start();
+    let mut escaped = false;
+    let end = rest.bytes().enumerate().skip(1).find_map(|(index, byte)| {
+        if escaped {
+            escaped = false;
+            None
+        } else if byte == b'\\' {
+            escaped = true;
+            None
+        } else {
+            (byte == b'"').then_some(index)
+        }
+    })?;
+    let spec = crate::zig_syntax::string_value(&rest[..=end])?;
+    let suffix = rest[end + 1..].trim_start().strip_prefix(')')?.trim();
+    let members = if suffix.is_empty() {
+        Vec::new()
+    } else {
+        zig_namespace_members(suffix.strip_prefix('.')?)?
+            .into_iter()
+            .map(crate::zig_syntax::identifier)
+            .collect()
+    };
     Some((spec, members))
 }
 
 fn normalize_zig_import_spec(spec: &str) -> String {
-    if spec.ends_with(".zig") && !spec.starts_with("./") && !spec.starts_with("../") {
-        format!("./{spec}")
-    } else {
-        spec.to_string()
-    }
+    crate::zig_syntax::import_spec(spec)
 }
 
 /// Build the global `bare-name → Vec<Qn>` table from a slice of passes.
@@ -368,53 +418,37 @@ pub fn run_with_table(
             // consumed even when it fails to resolve, preventing pass C from
             // binding an unrelated top-level or nested homonym.
             if lang == Some(Lang::Zig) {
-                if let Some(receiver) = raw.receiver.as_deref() {
-                    let resolution = zig_namespaces.resolve(&fp.file, receiver, &raw.bare_name);
-                    let target = match resolution {
-                        ZigNamespaceResolution::NotNamespace => None,
-                        ZigNamespaceResolution::Resolved(target) => {
-                            Some((CallTarget::Resolved(target), Confidence::Exact))
-                        }
-                        ZigNamespaceResolution::Unresolved => Some((
-                            CallTarget::Bare(raw.bare_name.clone()),
-                            Confidence::Ambiguous,
-                        )),
-                    };
-                    if let Some((target, confidence)) = target {
-                        let edge = raw_to_edge(
-                            raw.clone(),
-                            target,
-                            confidence,
-                            rel_path(root, &fp.file),
-                            Vec::new(),
-                        );
-                        forward.entry(edge.source.clone()).or_default().push(edge);
-                        continue;
-                    }
+                let resolution = if let Some(receiver) = raw.receiver.as_deref() {
+                    zig_namespaces.resolve(&fp.file, receiver, &raw.bare_name)
                 } else {
-                    let resolution =
-                        zig_namespaces.resolve_callable_alias(&fp.file, &raw.bare_name);
-                    let target = match resolution {
-                        ZigNamespaceResolution::NotNamespace => None,
-                        ZigNamespaceResolution::Resolved(target) => {
-                            Some((CallTarget::Resolved(target), Confidence::Exact))
-                        }
-                        ZigNamespaceResolution::Unresolved => Some((
-                            CallTarget::Bare(raw.bare_name.clone()),
-                            Confidence::Ambiguous,
-                        )),
-                    };
-                    if let Some((target, confidence)) = target {
-                        let edge = raw_to_edge(
-                            raw.clone(),
-                            target,
-                            confidence,
-                            rel_path(root, &fp.file),
-                            Vec::new(),
-                        );
-                        forward.entry(edge.source.clone()).or_default().push(edge);
-                        continue;
+                    zig_namespaces.resolve_callable_alias(&fp.file, &raw.bare_name)
+                };
+                let resolved = match resolution {
+                    ZigNamespaceResolution::NotNamespace => None,
+                    ZigNamespaceResolution::Resolved(target) => {
+                        Some((CallTarget::Resolved(target), Confidence::Exact, Vec::new()))
                     }
+                    ZigNamespaceResolution::Unresolved => Some((
+                        CallTarget::Bare(raw.bare_name.clone()),
+                        Confidence::Ambiguous,
+                        Vec::new(),
+                    )),
+                    ZigNamespaceResolution::Candidates(candidates) => Some((
+                        CallTarget::Bare(raw.bare_name.clone()),
+                        Confidence::Ambiguous,
+                        candidates,
+                    )),
+                };
+                if let Some((target, confidence, candidates)) = resolved {
+                    let edge = raw_to_edge(
+                        raw.clone(),
+                        target,
+                        confidence,
+                        rel_path(root, &fp.file),
+                        candidates,
+                    );
+                    forward.entry(edge.source.clone()).or_default().push(edge);
+                    continue;
                 }
             }
 
@@ -450,6 +484,18 @@ pub fn run_with_table(
                         // graph either confirms the target (`Inferred`) or
                         // the edge stays honestly `Ambiguous`.
                         let normalized = namespace_to_qualified(recv);
+                        if lang == Some(Lang::Zig)
+                            && (recv == "@This()" || recv.starts_with("@This()."))
+                        {
+                            let scope = normalized.strip_prefix("@This()::").unwrap_or("");
+                            let tail = if scope.is_empty() {
+                                raw.bare_name.clone()
+                            } else {
+                                format!("{scope}::{}", raw.bare_name)
+                            };
+                            let want = format!("{}::{tail}", file_rel(root, &fp.file));
+                            return fp.defined.iter().find(|q| q.0 == want).cloned();
+                        }
                         // Rust self-relative prefixes (`crate::`, `self::`,
                         // `super::…`) never appear inside qns — those start
                         // with the repo-relative file path. Each prefix
@@ -466,6 +512,9 @@ pub fn run_with_table(
                         let mut rest = normalized.as_str();
                         let mut rel: Option<SelfRel> = None;
                         loop {
+                            if lang == Some(Lang::Zig) {
+                                break;
+                            }
                             if let Some(r) = rest.strip_prefix("crate::") {
                                 rest = r;
                                 rel = Some(SelfRel::Crate);
@@ -579,8 +628,7 @@ pub fn run_with_table(
                             .filter(|q| q.0.ends_with(&full))
                             .filter(|q| {
                                 let scope = &q.0[..q.0.len() - full.len()];
-                                caller == scope
-                                    || caller.starts_with(&format!("{}::", scope))
+                                caller == scope || caller.starts_with(&format!("{}::", scope))
                             })
                             .max_by_key(|q| q.0.len())
                             .cloned()
@@ -708,7 +756,13 @@ pub fn run_with_table(
     for (raw, src_file, cands) in ambiguous_buffer {
         let (target, confidence, candidates) =
             disambiguate(deps, root, &src_file, &raw.bare_name, &cands, &mut closures);
-        let edge = raw_to_edge(raw, target, confidence, rel_path(root, &src_file), candidates);
+        let edge = raw_to_edge(
+            raw,
+            target,
+            confidence,
+            rel_path(root, &src_file),
+            candidates,
+        );
         forward.entry(edge.source.clone()).or_default().push(edge);
     }
 

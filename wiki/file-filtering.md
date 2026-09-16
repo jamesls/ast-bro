@@ -155,3 +155,7 @@ If `ast-bro` shows a file but you want it excluded:
 - **Hardcoded denylist over pure `.gitignore` reliance**: protects users with permissive `.gitignore` from accidentally indexing 1 GB of `node_modules`. A fresh repo cannot index its own `node_modules` through a directory walk, but an explicit path still works.
 - **No CLI flag to disable the denylist in v1**: keeps the surface small. If you genuinely need to walk `node_modules`, point ast-bro at it directly: `ast-bro digest node_modules/some-package` (the denylist is component-based and only triggers when `node_modules` appears as an *intermediate* component).
 - **Same filtering for map + search**: both use the shared walker, but a new language still needs shape-command routing and an `is_indexable` search entry.
+
+The `build` denylist entry has one source exception: directories below `src`
+remain walkable. This includes Zig build implementations under `src/build`.
+ZON files (`.zon`) enter dependencies, graph fingerprints, and plain-text search.

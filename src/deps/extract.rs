@@ -8,9 +8,7 @@
 
 use ast_grep_core::{Doc, Node};
 use ast_grep_language::{LanguageExt, SupportLang};
-use regex::Regex;
 use std::path::Path;
-use std::sync::LazyLock;
 
 use crate::deps::graph::ImportKind;
 use crate::deps::resolver::build::Lang;
@@ -377,8 +375,7 @@ fn strip_quotes(s: &str) -> String {
     // ends_with against itself, but `t[1..t.len() - 1]` would panic on
     // `1..0`. Require a real pair (>= 2 bytes) before stripping.
     if t.len() >= 2
-        && ((t.starts_with('"') && t.ends_with('"'))
-            || (t.starts_with('\'') && t.ends_with('\'')))
+        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
     {
         t[1..t.len() - 1].to_string()
     } else {
@@ -584,7 +581,11 @@ fn _walk_csharp<'a, D: Doc>(node: &Node<'a, D>, out: &mut Vec<RawImport>) {
         if kind == "using_directive" {
             let line = (c.start_pos().line() + 1) as u32;
             let stmt = c.text().into_owned();
-            let body = stmt.trim_start_matches("using").trim_end_matches(';').trim().to_string();
+            let body = stmt
+                .trim_start_matches("using")
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
             let is_static = body.starts_with("static ");
             let rest = body.trim_start_matches("static ").trim().to_string();
 
@@ -617,7 +618,10 @@ fn _walk_csharp<'a, D: Doc>(node: &Node<'a, D>, out: &mut Vec<RawImport>) {
                 local_name: None,
                 raw_path: Some(dotted),
             });
-        } else if matches!(kind, "namespace_declaration" | "file_scoped_namespace_declaration") {
+        } else if matches!(
+            kind,
+            "namespace_declaration" | "file_scoped_namespace_declaration"
+        ) {
             // Recurse into namespace bodies; usings can live inside.
             _walk_csharp(&c, out);
         }
@@ -743,7 +747,11 @@ fn consume_cpp_include<'a, D: Doc>(node: &Node<'a, D>, out: &mut Vec<RawImport>)
             // `#include <vector>` — system header. Emit so it shows up in
             // external listings; the resolver won't find it inside the project.
             let raw = sub.text().into_owned();
-            let inner = raw.trim().trim_start_matches('<').trim_end_matches('>').to_string();
+            let inner = raw
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string();
             if inner.is_empty() {
                 continue;
             }
@@ -838,7 +846,13 @@ fn consume_php_use<'a, D: Doc>(node: &Node<'a, D>, out: &mut Vec<RawImport>) {
                 let ik = inner.kind();
                 let ik = ik.as_ref();
                 if (ik == "qualified_name" || ik == "namespace_name") && prefix.is_none() {
-                    prefix = Some(inner.text().into_owned().trim_start_matches('\\').to_string());
+                    prefix = Some(
+                        inner
+                            .text()
+                            .into_owned()
+                            .trim_start_matches('\\')
+                            .to_string(),
+                    );
                 } else if ik == "namespace_use_group_clause" || ik == "namespace_use_clause" {
                     let text = inner.text().into_owned();
                     let (item, alias) = match text.split_once(" as ") {
@@ -913,12 +927,7 @@ fn _php_extract_string_arg<'a, D: Doc>(node: &Node<'a, D>) -> Option<String> {
     let k = k.as_ref();
     if k == "string" || k == "encapsed_string" {
         let raw = node.text().into_owned();
-        return Some(
-            raw.trim()
-                .trim_matches('\'')
-                .trim_matches('"')
-                .to_string(),
-        );
+        return Some(raw.trim().trim_matches('\'').trim_matches('"').to_string());
     }
     if k == "parenthesized_expression" {
         for inner in node.children() {
@@ -993,11 +1002,7 @@ fn consume_ruby_call<'a, D: Doc>(node: &Node<'a, D>, out: &mut Vec<RawImport>) {
         return;
     }
     let raw = path_arg.text().into_owned();
-    let path = raw
-        .trim()
-        .trim_matches('\'')
-        .trim_matches('"')
-        .to_string();
+    let path = raw.trim().trim_matches('\'').trim_matches('"').to_string();
     if path.is_empty() {
         return;
     }
@@ -1042,47 +1047,65 @@ fn consume_ruby_call<'a, D: Doc>(node: &Node<'a, D>, out: &mut Vec<RawImport>) {
 
 // ---- Zig ----
 
-static ZIG_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?x)
-        (?:
-            \bconst\s+
-            (?P<local>[A-Za-z_][A-Za-z0-9_]*)
-            (?:\s*:[^=]+)?
-            \s*=\s*
-        )?
-        @import\s*\(\s*"(?P<spec>[^"\r\n]+)"\s*\)
-        "#,
-    )
-    .expect("Zig import regex must compile")
-});
-
 fn extract_zig(src: &str) -> Vec<RawImport> {
+    let tree = crate::zig_syntax::parse(src.as_bytes());
     let mut out = Vec::new();
-    for (line_index, raw_line) in src.lines().enumerate() {
-        for captures in ZIG_IMPORT_RE.captures_iter(raw_line) {
-            let Some(spec_match) = captures.name("spec") else {
-                continue;
-            };
-            let raw_spec = spec_match.as_str();
-            let spec = if raw_spec.ends_with(".zig")
-                && !raw_spec.starts_with("./")
-                && !raw_spec.starts_with("../")
-            {
-                format!("./{raw_spec}")
-            } else {
-                raw_spec.to_string()
-            };
-            out.push(RawImport {
-                spec,
-                kind: ImportKind::Bare,
-                line: (line_index + 1) as u32,
-                statement: raw_line.trim().to_string(),
-                local_name: captures.name("local").map(|m| m.as_str().to_string()),
-                raw_path: Some(raw_spec.to_string()),
-            });
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "builtin_function" {
+            let name = node
+                .named_child(0)
+                .and_then(|n| n.utf8_text(src.as_bytes()).ok());
+            if name == Some("@import") {
+                let mut cursor = node.walk();
+                let args = node
+                    .named_children(&mut cursor)
+                    .find(|n| n.kind() == "arguments");
+                let literal = args.and_then(|args| {
+                    let mut cursor = args.walk();
+                    let literal = args
+                        .named_children(&mut cursor)
+                        .find(|node| node.kind() != "comment");
+                    literal.filter(|node| node.kind() == "string")
+                });
+                if let Some(raw_spec) = literal
+                    .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+                    .and_then(crate::zig_syntax::string_value)
+                {
+                    let owner = node.parent().filter(|n| n.kind() == "variable_declaration");
+                    let local_name = owner
+                        .and_then(|node| {
+                            let mut cursor = node.walk();
+                            let name = node
+                                .named_children(&mut cursor)
+                                .find(|node| node.kind() == "identifier");
+                            name
+                        })
+                        .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+                        .filter(|name| *name != "_")
+                        .map(crate::zig_syntax::identifier);
+                    let statement = owner
+                        .unwrap_or(node)
+                        .utf8_text(src.as_bytes())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    out.push(RawImport {
+                        spec: crate::zig_syntax::import_spec(&raw_spec),
+                        kind: ImportKind::Bare,
+                        line: node.start_position().row as u32 + 1,
+                        statement,
+                        local_name,
+                        raw_path: Some(raw_spec),
+                    });
+                }
+            }
         }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
     }
+    out.sort_by_key(|import| import.line);
     out
 }
 

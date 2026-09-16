@@ -263,11 +263,10 @@ pub fn resolve(spec: &str, ctx: &ResolveCtx<'_>, idx: &SuffixIndex) -> Option<Pa
         return None;
     }
 
-    // Zig's bare names (`std`, `builtin`, `root`, and build-script modules)
-    // are not filesystem paths and cannot be resolved without evaluating
-    // `build.zig`.
+    // Zig module names require build wiring. Resolve literal local wiring;
+    // generated modules and compiler-provided namespaces remain external.
     if ctx.lang == Lang::Zig {
-        return None;
+        return crate::zig_syntax::build::resolve_named_import(ctx.from_file, spec);
     }
 
     // Python `from a.b import c` arrives normalised to `a/b/c` already.

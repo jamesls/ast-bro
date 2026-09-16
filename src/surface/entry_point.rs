@@ -192,7 +192,8 @@ fn discover_zig(input: &Path) -> Result<EntryPoint, SurfaceError> {
 
     let root_file = conventional_zig_root(input).or_else(|| {
         let build = input.join("build.zig");
-        build.is_file().then_some(build)
+        crate::zig_syntax::build::compilation_root(&build)
+            .or_else(|| build.is_file().then_some(build))
     });
     root_file
         .map(|root_file| EntryPoint::ZigModule { root_file })
@@ -203,10 +204,8 @@ fn discover_zig(input: &Path) -> Result<EntryPoint, SurfaceError> {
         })
 }
 
-/// Zig deliberately leaves package topology to `build.zig`. Evaluating an
-/// arbitrary build program is neither safe nor deterministic here, so use
-/// the source roots established by Zig's project templates. If none exists,
-/// callers fall back to the build script itself.
+/// Prefer roots established by Zig's project templates. Discovery then tries
+/// a unique literal build root before falling back to the build script itself.
 fn conventional_zig_root(dir: &Path) -> Option<PathBuf> {
     ["src/root.zig", "src/lib.zig", "src/main.zig"]
         .into_iter()

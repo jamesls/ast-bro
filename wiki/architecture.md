@@ -13,7 +13,7 @@
 
 The dep graph and call graph share one on-disk cache at `.ast-bro/deps/graph.bin` (`UnifiedGraph { deps, calls: Option<CallGraph> }`) and a process-wide registry in `src/graph_cache/`. The registry keeps one entry per canonical repository root, revalidates it on every call, reuses its `Arc<UnifiedGraph>` while the tree is unchanged, and swaps in a patched `Arc` after an edit. `impact` and `context` use the same unified cache.
 
-Most adapters use the [tree-sitter](https://tree-sitter.github.io/tree-sitter/) parsers exposed by [`ast-grep`](https://ast-grep.github.io/). Markdown and Zig instead use a raw `tree_sitter::Parser`, while SQL uses a regex parser. Directory walks use `rayon` for parallel work.
+Most adapters use the [tree-sitter](https://tree-sitter.github.io/tree-sitter/) parsers exposed by [`ast-grep`](https://ast-grep.github.io/). Markdown and Zig instead use a raw `tree_sitter::Parser`, while SQL uses a regex parser. Zig structural search wraps the same bundled grammar in ast-grep's `Language` trait. See [Zig support](zig.md) for coverage and static analysis limits. Directory walks use `rayon` for parallel work.
 
 The walking subsystems share ignore handling and the hardcoded denylist in `src/file_filter.rs`, but their extension gates differ. Shape commands use `can_parse_for_hook`, dependencies use `deps::resolver::Lang::from_path`, and search plus graph fingerprints use `search::chunker::is_indexable`. See [file-filtering.md](file-filtering.md). The `squeeze` command is the exception because it reads one explicit file directly. `file_filter.rs` also defines `is_test_file`, shebang-based `detect_language`, and the canonical-path `file_identity` key used to deduplicate overlapping walk roots.
 

@@ -75,7 +75,10 @@ fn mcp_map_all_missing_paths_is_an_error() {
         serde_json::json!({"paths": ["/nope/missing-xyz.rs"]}),
     );
     let (_, is_error, text) = result_of(&resp);
-    assert!(is_error, "missing input must not read as an empty answer: {resp}");
+    assert!(
+        is_error,
+        "missing input must not read as an empty answer: {resp}"
+    );
     assert!(
         text.contains("resolved 0 of 1"),
         "message should say nothing was inspected: {text}"
@@ -160,7 +163,10 @@ fn mcp_trace_unresolved_target_is_an_error() {
             serde_json::json!({"from": "a", "to": "no_such_symbol_xyz", "json": json}),
         );
         let (_, is_error, text) = result_of(&resp);
-        assert!(is_error, "unresolved trace target must be isError (json={json}): {resp}");
+        assert!(
+            is_error,
+            "unresolved trace target must be isError (json={json}): {resp}"
+        );
         assert!(
             text.contains("no_such_symbol_xyz"),
             "diagnostic must name the missing symbol: {text}"
@@ -184,7 +190,10 @@ fn mcp_implements_unknown_type_is_an_error() {
         serde_json::json!({"target": "NoSuchType", "paths": ["."]}),
     );
     let (_, is_error, text) = result_of(&resp);
-    assert!(is_error, "unknown type must not read as an empty answer: {resp}");
+    assert!(
+        is_error,
+        "unknown type must not read as an empty answer: {resp}"
+    );
     assert!(text.contains("NoSuchType"), "{text}");
 
     // A real type with no implementors stays a legitimate 0-match success.
@@ -194,7 +203,10 @@ fn mcp_implements_unknown_type_is_an_error() {
         serde_json::json!({"target": "Leaf", "paths": ["."]}),
     );
     let (_, is_error, text) = result_of(&resp);
-    assert!(!is_error, "an empty answer for an existing type is still an answer: {resp}");
+    assert!(
+        !is_error,
+        "an empty answer for an existing type is still an answer: {resp}"
+    );
     assert!(text.contains("0 match(es)"), "{text}");
 }
 
@@ -213,7 +225,10 @@ fn mcp_find_related_unknown_location_is_an_error_in_json_mode_too() {
         serde_json::json!({"path": "nope/missing.rs", "line": 1, "root": ".", "json": true}),
     );
     let (_, is_error, text) = result_of(&resp);
-    assert!(is_error, "json mode must not return a valid-looking empty results list: {resp}");
+    assert!(
+        is_error,
+        "json mode must not return a valid-looking empty results list: {resp}"
+    );
     assert!(
         !text.contains("\"results\""),
         "no ast-bro.related.v1 payload for a rejected call: {text}"
@@ -226,19 +241,17 @@ fn mcp_find_related_unknown_location_is_an_error_in_json_mode_too() {
 }
 
 #[test]
-fn mcp_run_zig_language_error_explains_ast_grep_limitation() {
+fn mcp_run_zig_uses_the_bundled_grammar() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("main.zig"), "pub fn work() void {}\n").unwrap();
     let resp = call_tool(
         tmp.path(),
         "run",
-        serde_json::json!({"pattern": "fn $F() {}", "lang": "zig"}),
+        serde_json::json!({"pattern": "pub fn $F() void {}", "lang": "zig"}),
     );
     let (_, is_error, text) = result_of(&resp);
-    assert!(is_error, "unsupported language must be an error: {resp}");
-    assert_eq!(
-        text,
-        "zig is not supported by run: ast-grep has no Zig grammar"
-    );
+    assert!(!is_error, "Zig search failed: {resp}");
+    assert!(text.contains("work"), "{text}");
 }
 
 #[test]
@@ -336,9 +349,21 @@ fn mcp_depth_cutoff_reports_the_frontier_on_every_walk() {
     )
     .unwrap();
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub mod a;\npub mod b;\npub mod c;\n").unwrap();
-    std::fs::write(root.join("src/a.rs"), "use crate::b::B;\npub struct A(pub B);\n").unwrap();
-    std::fs::write(root.join("src/b.rs"), "use crate::c::C;\npub struct B(pub C);\n").unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub mod a;\npub mod b;\npub mod c;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "use crate::b::B;\npub struct A(pub B);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "use crate::c::C;\npub struct B(pub C);\n",
+    )
+    .unwrap();
     std::fs::write(root.join("src/c.rs"), "pub struct C;\n").unwrap();
 
     for (tool, file) in [("deps", "src/a.rs"), ("reverse_deps", "src/c.rs")] {

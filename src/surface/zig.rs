@@ -45,9 +45,10 @@ pub fn resolve(
     Ok(walker.entries)
 }
 
-#[derive(Clone)]
 struct FileSnapshot {
     declarations: Vec<Declaration>,
+    aliases: HashMap<usize, AliasExpression>,
+    returned_containers: HashMap<usize, (usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -115,12 +116,75 @@ impl PublicLookup {
         }
         Some(PublicPath {
             file: target.file,
-            path: target.path,
+            path: target
+                .path
+                .into_iter()
+                .map(|name| {
+                    if name.starts_with("@\"") {
+                        crate::zig_syntax::identifier(&name)
+                    } else {
+                        name
+                    }
+                })
+                .collect(),
         })
+    }
+
+    /// Return every statically named conditional branch, without selecting a
+    /// build configuration. Private names are allowed only in the source file.
+    pub fn candidates(
+        &mut self,
+        file: &Path,
+        path: &[String],
+        local: bool,
+    ) -> Option<Vec<PublicPath>> {
+        let mut targets = vec![Target {
+            file: file.to_path_buf(),
+            path: Vec::new(),
+        }];
+        for member in path {
+            let mut next = Vec::new();
+            for target in targets {
+                let mut stack = HashSet::new();
+                let mut hops = Vec::new();
+                let public = !local || cache_key(&target.file) != cache_key(file);
+                if let Some(target) = self
+                    .walker
+                    .lookup_namespace_member(&target, member, 0, &mut stack, &mut hops, public)
+                {
+                    next.extend(self.walker.alias_candidates(target, 0, &mut stack)?);
+                } else {
+                    return None;
+                }
+            }
+            next.sort_by(|a, b| (&a.file, &a.path).cmp(&(&b.file, &b.path)));
+            next.dedup();
+            targets = next;
+        }
+        Some(
+            targets
+                .into_iter()
+                .map(|target| PublicPath {
+                    file: target.file,
+                    path: target
+                        .path
+                        .into_iter()
+                        .map(|name| {
+                            if name.starts_with("@\"") {
+                                crate::zig_syntax::identifier(&name)
+                            } else {
+                                name
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
     }
 }
 
 struct Walker {
+    conditional_depth: usize,
     max_depth: usize,
     include_private: bool,
     loaded: HashMap<PathBuf, FileSnapshot>,
@@ -144,6 +208,7 @@ struct Walker {
 impl Walker {
     fn new(max_depth: usize, include_private: bool) -> Self {
         Self {
+            conditional_depth: 0,
             max_depth,
             include_private,
             loaded: HashMap::new(),
@@ -277,8 +342,64 @@ impl Walker {
             return;
         }
 
-        let alias_expression = declaration_alias_expression(declaration);
+        let alias_expression = self.alias_expression(file, declaration);
         if let Some(expression) = alias_expression {
+            let conditional_choices = match &expression.root {
+                AliasRoot::Choices(choices) if depth < self.max_depth => Some(choices),
+                _ => None,
+            };
+            if let Some(choices) = conditional_choices {
+                self.conditional_depth += 1;
+                let mut exposed = false;
+                for choice in choices {
+                    if let Some(resolved) = self.resolve_expression(file, source_scope, choice) {
+                        let mut next_chain = chain.clone();
+                        next_chain.push(re_export_hop(file, source_scope, declaration));
+                        next_chain.extend(resolved.hops);
+                        // Distinct conditional definitions intentionally share
+                        // their public name; their source and chain identify
+                        // each candidate. Do not silently choose one branch.
+                        let qualified = qualified_name(exposed_prefix, &declaration.name);
+                        self.seen_qualified.retain(|name| {
+                            name != &qualified && !name.starts_with(&format!("{qualified}."))
+                        });
+                        if resolved.target.path.is_empty() {
+                            self.emit(
+                                exposed_prefix,
+                                &declaration.name,
+                                declaration,
+                                file,
+                                next_chain.clone(),
+                                via_glob,
+                            );
+                            let mut prefix = exposed_prefix.to_vec();
+                            prefix.push(declaration.name.clone());
+                            self.walk_namespace(
+                                &resolved.target.file,
+                                &[],
+                                &prefix,
+                                depth + 1,
+                                next_chain,
+                                via_glob,
+                            );
+                        } else {
+                            self.emit_target(
+                                &resolved.target,
+                                exposed_prefix,
+                                &declaration.name,
+                                depth + 1,
+                                next_chain,
+                                via_glob,
+                            );
+                        }
+                        exposed = true;
+                    }
+                }
+                self.conditional_depth -= 1;
+                if exposed {
+                    return;
+                }
+            }
             if depth < self.max_depth {
                 if let Some(resolved) = self.resolve_expression(file, source_scope, &expression) {
                     let mut next_chain = chain.clone();
@@ -458,6 +579,7 @@ impl Walker {
             return;
         }
         self.entries.push(SurfaceEntry {
+            conditional: self.conditional_depth > 0,
             qualified_path,
             kind: declaration.kind,
             signature: declaration.signature.clone(),
@@ -550,6 +672,52 @@ impl Walker {
                 path: source_scope.to_vec(),
             },
             AliasRoot::Identifier(name) => self.lookup_lexical(file, source_scope, name)?,
+            AliasRoot::Choices(choices) => {
+                let mut candidates = Vec::new();
+                for choice in choices {
+                    candidates.push(self.evaluate_expression(
+                        file,
+                        source_scope,
+                        choice,
+                        alias_depth + 1,
+                        alias_stack,
+                        hops,
+                    )?);
+                }
+                let first = candidates.first()?.clone();
+                if candidates.iter().any(|candidate| candidate != &first) {
+                    return None;
+                }
+                first
+            }
+            AliasRoot::Apply(function) => {
+                let mut target = self.evaluate_expression(
+                    file,
+                    source_scope,
+                    function,
+                    alias_depth + 1,
+                    alias_stack,
+                    hops,
+                )?;
+                let declaration = self.declaration_at(&target)?;
+                if !matches!(
+                    declaration.kind,
+                    DeclarationKind::Function | DeclarationKind::Method
+                ) || !declaration.signature.trim_end().ends_with(" type")
+                {
+                    return None;
+                }
+                let range = *self
+                    .snapshot(&target.file)?
+                    .returned_containers
+                    .get(&declaration.start_byte)?;
+                let container = declaration
+                    .children
+                    .iter()
+                    .find(|child| child.start_byte == range.0 && child.end_byte == range.1)?;
+                target.path.push(container.name.clone());
+                target
+            }
         };
         target = self.dereference_alias(target, alias_depth, alias_stack, hops)?;
 
@@ -587,7 +755,7 @@ impl Walker {
             return None;
         }
         let declaration = self.declaration_at(&target)?;
-        let Some(expression) = declaration_alias_expression(&declaration) else {
+        let Some(expression) = self.alias_expression(&target.file, &declaration) else {
             return Some(target);
         };
 
@@ -607,6 +775,51 @@ impl Walker {
         );
         alias_stack.remove(&key);
         resolved
+    }
+
+    fn alias_candidates(
+        &mut self,
+        target: Target,
+        depth: usize,
+        stack: &mut HashSet<(PathBuf, String)>,
+    ) -> Option<Vec<Target>> {
+        if depth > self.max_depth {
+            return None;
+        }
+        let Some(declaration) = self.declaration_at(&target) else {
+            return Some(vec![target]);
+        };
+        let Some(expression) = self.alias_expression(&target.file, &declaration) else {
+            return Some(vec![target]);
+        };
+        let key = (cache_key(&target.file), target.path.join("."));
+        if !stack.insert(key.clone()) {
+            return None;
+        }
+        let scope = &target.path[..target.path.len() - 1];
+        let choices = if let AliasRoot::Choices(choices) = expression.root.clone() {
+            choices
+        } else {
+            vec![expression]
+        };
+        let mut result = Vec::new();
+        for choice in choices {
+            if let Some(resolved) = self.evaluate_expression(
+                &target.file,
+                scope,
+                &choice,
+                depth + 1,
+                stack,
+                &mut Vec::new(),
+            ) {
+                result.push(resolved);
+            } else {
+                stack.remove(&key);
+                return None;
+            }
+        }
+        stack.remove(&key);
+        Some(result)
     }
 
     fn lookup_lexical(
@@ -733,7 +946,8 @@ impl Walker {
             .into_iter()
             .find(|declaration| {
                 declaration.native_kind.as_deref() != Some("usingnamespace")
-                    && declaration.name == name
+                    && crate::zig_syntax::identifier(&declaration.name)
+                        == crate::zig_syntax::identifier(name)
             })
     }
 
@@ -749,27 +963,76 @@ impl Walker {
     ) -> Option<Vec<Declaration>> {
         let snapshot = self.snapshot(file)?;
         if source_scope.is_empty() {
-            return Some(snapshot.declarations);
+            return Some(snapshot.declarations.clone());
         }
         let declaration = declaration_by_path(&snapshot.declarations, source_scope)?;
         Some(declaration.children.clone())
     }
 
-    fn snapshot(&mut self, file: &Path) -> Option<FileSnapshot> {
+    fn alias_expression(
+        &mut self,
+        file: &Path,
+        declaration: &Declaration,
+    ) -> Option<AliasExpression> {
+        self.snapshot(file)?
+            .aliases
+            .get(&declaration.start_byte)
+            .cloned()
+    }
+
+    fn snapshot(&mut self, file: &Path) -> Option<&FileSnapshot> {
         let key = cache_key(file);
         if !self.loaded.contains_key(&key) {
             let parsed = parse_file(file)?;
             if parsed.language != "zig" {
                 return None;
             }
+            let tree = crate::zig_syntax::parse(&parsed.source);
+            let source = std::str::from_utf8(&parsed.source).ok()?;
+            let mut aliases = HashMap::new();
+            let mut returned_containers = HashMap::new();
+            let mut pending = vec![tree.root_node()];
+            while let Some(node) = pending.pop() {
+                if node.kind() == "variable_declaration" {
+                    let mut cursor = node.walk();
+                    let children: Vec<_> = node.children(&mut cursor).collect();
+                    if children.iter().any(|node| node.kind() == "const") {
+                        if let Some(equals) = children.iter().position(|node| node.kind() == "=") {
+                            if let Some(initializer) = children[equals + 1..]
+                                .iter()
+                                .find(|node| node.is_named() && node.kind() != "comment")
+                            {
+                                if let Some(alias) = alias_from_node(*initializer, source) {
+                                    aliases.insert(node.start_byte(), alias);
+                                }
+                            }
+                        }
+                    }
+                }
+                if node.kind() == "function_declaration" {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        if let [container] = crate::zig_syntax::returned_containers(body).as_slice()
+                        {
+                            returned_containers.insert(
+                                node.start_byte(),
+                                (container.start_byte(), container.end_byte()),
+                            );
+                        }
+                    }
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
             self.loaded.insert(
                 key.clone(),
                 FileSnapshot {
                     declarations: parsed.declarations,
+                    aliases,
+                    returned_containers,
                 },
             );
         }
-        self.loaded.get(&key).cloned()
+        self.loaded.get(&key)
     }
 }
 
@@ -778,9 +1041,9 @@ fn declaration_by_path<'a>(
     path: &[String],
 ) -> Option<&'a Declaration> {
     let (name, tail) = path.split_first()?;
-    let declaration = declarations
-        .iter()
-        .find(|declaration| &declaration.name == name)?;
+    let declaration = declarations.iter().find(|declaration| {
+        crate::zig_syntax::identifier(&declaration.name) == crate::zig_syntax::identifier(name)
+    })?;
     if tail.is_empty() {
         Some(declaration)
     } else {
@@ -821,10 +1084,9 @@ fn cache_key(file: &Path) -> PathBuf {
 }
 
 fn resolve_relative_import(from_file: &Path, specifier: &str) -> Option<PathBuf> {
-    // `@import("std")`, generated modules, and names installed by build.zig
-    // cannot be mapped to a source file without evaluating the build graph.
+    // Named modules resolve only when literal build wiring identifies a file.
     if !specifier.ends_with(".zig") {
-        return None;
+        return crate::zig_syntax::build::resolve_named_import(from_file, specifier);
     }
     let target = from_file.parent()?.join(specifier);
     if !target.is_file() {
@@ -861,14 +1123,8 @@ enum AliasRoot {
     Import(String),
     This,
     Identifier(String),
-}
-
-fn declaration_alias_expression(declaration: &Declaration) -> Option<AliasExpression> {
-    if declaration.native_kind.as_deref() != Some("const") {
-        return None;
-    }
-    let rhs = assignment_rhs(&declaration.signature)?;
-    parse_alias_expression(rhs)
+    Apply(Box<AliasExpression>),
+    Choices(Vec<AliasExpression>),
 }
 
 fn usingnamespace_expression(declaration: &Declaration) -> Option<AliasExpression> {
@@ -880,6 +1136,7 @@ fn usingnamespace_expression(declaration: &Declaration) -> Option<AliasExpressio
     parse_alias_expression(expression.trim_end_matches(';').trim())
 }
 
+#[cfg(test)]
 fn assignment_rhs(signature: &str) -> Option<&str> {
     let bytes = signature.as_bytes();
     let mut parens = 0usize;
@@ -923,102 +1180,96 @@ fn assignment_rhs(signature: &str) -> Option<&str> {
 }
 
 fn parse_alias_expression(expression: &str) -> Option<AliasExpression> {
-    let bytes = expression.as_bytes();
-    let mut position = skip_ascii_space(bytes, 0);
-    let root = if bytes.get(position..)?.starts_with(b"@import") {
-        position += "@import".len();
-        position = skip_ascii_space(bytes, position);
-        if bytes.get(position) != Some(&b'(') {
-            return None;
+    let source = format!("const alias = {expression};");
+    let tree = crate::zig_syntax::parse(source.as_bytes());
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let declaration = tree.root_node().named_child(0)?;
+    let mut cursor = declaration.walk();
+    let value = declaration.named_children(&mut cursor).last()?;
+    alias_from_node(value, &source)
+}
+
+fn alias_from_node(node: tree_sitter::Node<'_>, source: &str) -> Option<AliasExpression> {
+    let text = |node: tree_sitter::Node<'_>| node.utf8_text(source.as_bytes()).ok();
+    let root = match node.kind() {
+        "identifier" => AliasRoot::Identifier(crate::zig_syntax::identifier(text(node)?)),
+        "parenthesized_expression" => {
+            return alias_from_node(crate::zig_syntax::first_expression(node)?, source)
         }
-        position = skip_ascii_space(bytes, position + 1);
-        let (specifier, next) = parse_quoted_string(expression, position)?;
-        position = skip_ascii_space(bytes, next);
-        if bytes.get(position) != Some(&b')') {
-            return None;
+        "field_expression" => {
+            let mut alias = alias_from_node(node.child_by_field_name("object")?, source)?;
+            let member = crate::zig_syntax::identifier(text(node.child_by_field_name("member")?)?);
+            if let AliasRoot::Choices(choices) = &mut alias.root {
+                for choice in choices {
+                    choice.members.push(member.clone());
+                }
+            } else {
+                alias.members.push(member);
+            }
+            return Some(alias);
         }
-        position += 1;
-        AliasRoot::Import(specifier)
-    } else if bytes.get(position..)?.starts_with(b"@This") {
-        position += "@This".len();
-        position = skip_ascii_space(bytes, position);
-        if bytes.get(position) != Some(&b'(') {
-            return None;
+        "builtin_function" => match text(node.named_child(0)?)? {
+            "@This" => AliasRoot::This,
+            "@import" => {
+                let mut cursor = node.walk();
+                let args = node
+                    .named_children(&mut cursor)
+                    .find(|n| n.kind() == "arguments")?;
+                AliasRoot::Import(crate::zig_syntax::string_value(text(
+                    crate::zig_syntax::first_expression(args)?,
+                )?)?)
+            }
+            _ => return None,
+        },
+        "call_expression" => AliasRoot::Apply(Box::new(alias_from_node(
+            node.child_by_field_name("function")?,
+            source,
+        )?)),
+        "if_expression" | "if_type_expression" => {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node
+                .named_children(&mut cursor)
+                .filter(|child| !matches!(child.kind(), "comment" | "payload"))
+                .collect();
+            let [condition, yes, no] = children.as_slice() else {
+                return None;
+            };
+            if text(*condition)? == "true" {
+                return alias_from_node(*yes, source);
+            }
+            if text(*condition)? == "false" {
+                return alias_from_node(*no, source);
+            }
+            AliasRoot::Choices(vec![
+                alias_from_node(*yes, source)?,
+                alias_from_node(*no, source)?,
+            ])
         }
-        position = skip_ascii_space(bytes, position + 1);
-        if bytes.get(position) != Some(&b')') {
-            return None;
+        "switch_expression" => {
+            let mut cursor = node.walk();
+            let choices: Option<Vec<_>> = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "switch_case")
+                .map(|case| {
+                    let mut cursor = case.walk();
+                    let value = case.named_children(&mut cursor).last()?;
+                    alias_from_node(value, source)
+                })
+                .collect();
+            let choices = choices?;
+            if choices.is_empty() {
+                return None;
+            }
+            AliasRoot::Choices(choices)
         }
-        position += 1;
-        AliasRoot::This
-    } else {
-        let (identifier, next) = parse_identifier(expression, position)?;
-        position = next;
-        AliasRoot::Identifier(identifier)
+        _ => return None,
     };
-
-    let mut members = Vec::new();
-    loop {
-        position = skip_ascii_space(bytes, position);
-        if position == bytes.len() {
-            break;
-        }
-        if bytes.get(position) != Some(&b'.') {
-            return None;
-        }
-        position = skip_ascii_space(bytes, position + 1);
-        let (member, next) = parse_identifier(expression, position)?;
-        members.push(member);
-        position = next;
-    }
-    Some(AliasExpression { root, members })
-}
-
-fn parse_identifier(input: &str, position: usize) -> Option<(String, usize)> {
-    let bytes = input.as_bytes();
-    if bytes.get(position..)?.starts_with(b"@\"") {
-        let (_, end) = parse_quoted_string(input, position + 1)?;
-        return Some((input[position..end].to_string(), end));
-    }
-    let first = *bytes.get(position)?;
-    if !(first == b'_' || first.is_ascii_alphabetic()) {
-        return None;
-    }
-    let mut end = position + 1;
-    while bytes
-        .get(end)
-        .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
-    {
-        end += 1;
-    }
-    Some((input[position..end].to_string(), end))
-}
-
-fn parse_quoted_string(input: &str, position: usize) -> Option<(String, usize)> {
-    let bytes = input.as_bytes();
-    if bytes.get(position) != Some(&b'"') {
-        return None;
-    }
-    let mut escaped = false;
-    let mut end = position + 1;
-    while let Some(&byte) = bytes.get(end) {
-        if escaped {
-            escaped = false;
-        } else if byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            return Some((input[position + 1..end].to_string(), end + 1));
-        }
-        end += 1;
-    }
-    None
-}
-
-fn skip_ascii_space(bytes: &[u8], mut position: usize) -> usize {
-    while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
-        position += 1;
-    }
-    position
+    Some(AliasExpression {
+        root,
+        members: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -1048,7 +1299,12 @@ mod tests {
                 members: vec!["Outer".into(), "Inner".into()],
             })
         );
-        assert!(parse_alias_expression("if (enabled) A else B").is_none());
+        assert!(matches!(
+            parse_alias_expression("if (enabled) A else B")
+                .unwrap()
+                .root,
+            AliasRoot::Choices(_)
+        ));
     }
 
     #[test]

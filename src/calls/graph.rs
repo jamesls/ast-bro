@@ -245,6 +245,25 @@ pub struct CallGraph {
 }
 
 impl CallGraph {
+    /// Inline tests and declarations nested inside them retain test identity.
+    pub fn is_test(&self, qn: &Qn) -> bool {
+        let mut current = qn.0.as_str();
+        loop {
+            if self
+                .callable_meta
+                .get(&Qn(current.to_string()))
+                .is_some_and(|meta| meta.kind == "test")
+            {
+                return true;
+            }
+            let Some(separator) = last_qualified_separator(current) else {
+                break;
+            };
+            current = &current[..separator];
+        }
+        crate::file_filter::is_test_file(&self.root.join(qn.file()), &self.root)
+    }
+
     pub fn empty(root: PathBuf) -> Self {
         Self {
             schema: JSON_SCHEMA_GRAPH_INDEX.to_string(),

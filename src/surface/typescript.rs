@@ -448,6 +448,7 @@ impl Walker {
             DeclarationKind::Class | DeclarationKind::Interface | DeclarationKind::Enum
         );
         self.entries.push(SurfaceEntry {
+            conditional: false,
             qualified_path: qpath.clone(),
             kind: decl.kind,
             signature: decl.signature.clone(),
@@ -471,6 +472,7 @@ impl Walker {
                     continue;
                 }
                 self.entries.push(SurfaceEntry {
+            conditional: false,
                     qualified_path: child_q,
                     kind: child.kind,
                     signature: child.signature.clone(),

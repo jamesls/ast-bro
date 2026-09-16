@@ -28,13 +28,11 @@ use crate::calls::pass::{file_rel, FilePass};
 use crate::calls::resolve;
 use crate::deps::extract::extract;
 use crate::deps::graph::{self as dep_graph, DepEdge};
-use crate::symbol_path::{
-    first_unquoted_byte, last_qualified_separator, last_unquoted_byte,
-};
 use crate::deps::manifest::detect_aliases;
 use crate::deps::resolver::{build_suffix_index, resolve as resolve_spec, ResolveCtx};
 use crate::deps::{DepError, DepGraph};
 use crate::search::cache::{hash_file, Delta, FileRecord};
+use crate::symbol_path::{first_unquoted_byte, last_qualified_separator, last_unquoted_byte};
 
 /// Drop entries for changed files from `deps` and re-extract+resolve any
 /// added/modified file. Suffix index is rebuilt fresh (one walk) since
@@ -45,12 +43,29 @@ pub fn apply_delta_to_deps(
     root: &Path,
     delta: &Delta,
 ) -> Result<(), DepError> {
-    let to_process = changed_abs_paths(root, delta);
+    let mut to_process = changed_abs_paths(root, delta);
     let removed_abs: Vec<PathBuf> = delta
         .removed
         .iter()
         .map(|rel| root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)))
         .collect();
+
+    // Literal build.zig wiring and file imports can change resolution in an
+    // unchanged Zig file. Refresh those dependencies alongside Zig callers so
+    // a warm graph agrees with a rebuild after a module is rewired or removed.
+    to_process.extend(
+        deps.forward
+            .keys()
+            .filter(|file| {
+                crate::deps::resolver::Lang::from_path(file)
+                    == Some(crate::deps::resolver::Lang::Zig)
+                    && file.is_file()
+                    && !removed_abs.contains(file)
+            })
+            .cloned(),
+    );
+    to_process.sort();
+    to_process.dedup();
 
     for abs in &removed_abs {
         deps.forward.remove(abs);
@@ -125,12 +140,7 @@ pub fn apply_delta_to_deps(
 /// changed files, re-extract added/modified files, splice the new qns +
 /// edges back in. `deps` is the *already-patched* deps graph so pass C's
 /// dep-closure filter sees post-update state.
-pub fn apply_delta_to_calls(
-    calls: &mut CallGraph,
-    deps: &DepGraph,
-    root: &Path,
-    delta: &Delta,
-) {
+pub fn apply_delta_to_calls(calls: &mut CallGraph, deps: &DepGraph, root: &Path, delta: &Delta) {
     // Build the set of relative POSIX paths whose qn-bearing entries we
     // need to invalidate. `Qn::file()` returns this same form, so the
     // membership check is a single string lookup.
@@ -151,17 +161,13 @@ pub fn apply_delta_to_calls(
     //    will be detected as stale after step 6 once we know which qns
     //    actually exist post-update. Demoting eagerly would cost the
     //    `Exact` confidence tag for edges whose target wasn't renamed.
-    calls
-        .forward
-        .retain(|qn, _| !changed.contains(qn.file()));
+    calls.forward.retain(|qn, _| !changed.contains(qn.file()));
 
     // 3. Drop changed-file qns from per-callable + per-type metadata.
     calls
         .callable_meta
         .retain(|qn, _| !changed.contains(qn.file()));
-    calls
-        .types
-        .retain(|qn, _| !changed.contains(qn.file()));
+    calls.types.retain(|qn, _| !changed.contains(qn.file()));
 
     // 4. Drop changed-file entries from the inverted indices and prune
     //    empty buckets so subsequent callers don't see ghost keys.
@@ -366,11 +372,7 @@ pub fn apply_delta_to_calls(
 /// after a partial update. Entries for removed files are dropped; added
 /// and modified entries are re-stat-and-hashed; mtime-only entries get
 /// their mtime refreshed without a re-hash; unchanged entries pass through.
-pub fn refresh_records(
-    prev: Vec<FileRecord>,
-    root: &Path,
-    delta: &Delta,
-) -> Vec<FileRecord> {
+pub fn refresh_records(prev: Vec<FileRecord>, root: &Path, delta: &Delta) -> Vec<FileRecord> {
     let removed: HashSet<&str> = delta.removed.iter().map(|s| s.as_str()).collect();
     let touched: HashSet<String> = delta
         .added
@@ -432,9 +434,7 @@ fn rel_posix(root: &Path, path: &Path) -> String {
 }
 
 fn mtime_nanos(meta: &std::fs::Metadata) -> i128 {
-    let mtime = meta
-        .modified()
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     match mtime.duration_since(std::time::SystemTime::UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as i128,
         Err(e) => -(e.duration().as_nanos() as i128),

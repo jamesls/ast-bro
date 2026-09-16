@@ -68,7 +68,7 @@ pub fn run(
     };
     // Cache compiled patterns per language when lang is auto-detected.
     let mut pattern_cache: std::collections::HashMap<
-        ast_grep_language::SupportLang,
+        super::RunLanguage,
         Result<ast_grep_core::Pattern, String>,
     > = std::collections::HashMap::new();
 
@@ -349,7 +349,10 @@ pub fn run(
     }
 }
 
-pub fn parse_lang(s: &str) -> Option<SupportLang> {
+pub fn parse_lang(s: &str) -> Option<super::RunLanguage> {
+    if s.eq_ignore_ascii_case("zig") {
+        return Some(super::RunLanguage::Zig);
+    }
     match s.to_lowercase().as_str() {
         "rs" | "rust" => Some(SupportLang::Rust),
         "py" | "python" => Some(SupportLang::Python),
@@ -366,15 +369,12 @@ pub fn parse_lang(s: &str) -> Option<SupportLang> {
         "php" => Some(SupportLang::Php),
         other => SupportLang::from_str(other).ok(),
     }
+    .map(super::RunLanguage::from)
 }
 
 /// Builds the `run` diagnostic for an unsupported language.
 pub(crate) fn unsupported_language_message(language: &str) -> String {
-    if language.eq_ignore_ascii_case("zig") {
-        "zig is not supported by run: ast-grep has no Zig grammar".to_owned()
-    } else {
-        format!("unsupported language '{}'", language)
-    }
+    format!("unsupported language '{}'", language)
 }
 
 /// Produce a path-prefixed, line-by-line change report between `old` and

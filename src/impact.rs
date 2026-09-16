@@ -97,17 +97,12 @@ pub struct ImpactReport {
     pub frontier_truncated: bool,
 }
 
-pub fn run_impact(
-    target: &str,
-    path: &Path,
-    opts: &ImpactOptions,
-    rebuild: bool,
-) -> i32 {
-    let (root, graph) =
-        match graph_cache::load_for_symbol_query("impact", path, rebuild, opts.json) {
-            Ok(pair) => pair,
-            Err(code) => return code,
-        };
+pub fn run_impact(target: &str, path: &Path, opts: &ImpactOptions, rebuild: bool) -> i32 {
+    let (root, graph) = match graph_cache::load_for_symbol_query("impact", path, rebuild, opts.json)
+    {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
     let calls = graph.calls();
     let candidates = resolve_target_full(calls, target);
     if candidates.is_empty() {
@@ -155,14 +150,21 @@ fn compute_impact(
     let (file_path, target_line, target_kind) = match c.kind {
         SymbolKind::Callable => {
             let meta = calls.callable_meta.get(&c.qn);
-            let file = meta.map(|m| m.file.clone()).unwrap_or_else(|| PathBuf::from(c.qn.file()));
+            let file = meta
+                .map(|m| m.file.clone())
+                .unwrap_or_else(|| PathBuf::from(c.qn.file()));
             let line = meta.map(|m| m.line).unwrap_or(0);
-            let kind = meta.map(|m| m.kind.as_str()).unwrap_or("function").to_string();
+            let kind = meta
+                .map(|m| m.kind.as_str())
+                .unwrap_or("function")
+                .to_string();
             (file, line, kind)
         }
         SymbolKind::Type => {
             let tmeta = calls.types.get(&c.qn);
-            let file = tmeta.map(|m| m.file.clone()).unwrap_or_else(|| PathBuf::from(c.qn.file()));
+            let file = tmeta
+                .map(|m| m.file.clone())
+                .unwrap_or_else(|| PathBuf::from(c.qn.file()));
             let line = tmeta.map(|m| m.line).unwrap_or(0);
             let kind = tmeta.map(|m| m.kind.as_str()).unwrap_or("type").to_string();
             (file, line, kind)
@@ -190,7 +192,9 @@ fn compute_impact(
 
     if matches!(opts.mode, ImpactMode::Dependents | ImpactMode::All) {
         sections.push(build_callers_section(c, calls, opts, root));
-        sections.push(build_file_reverse_deps_section(&file_path, deps, root, opts));
+        sections.push(build_file_reverse_deps_section(
+            &file_path, deps, root, opts,
+        ));
     }
 
     let mut transitive = BTreeMap::new();
@@ -208,7 +212,7 @@ fn compute_impact(
         if !opts.tests && !opts.exclude_tests {
             return true;
         }
-        let is_test = is_test_file(&root.join(&e.file), root);
+        let is_test = calls.is_test(&e.source);
         if opts.exclude_tests {
             !is_test
         } else {
@@ -218,8 +222,7 @@ fn compute_impact(
     report.frontier_truncated |= walk.frontier_truncated;
     let all_callers = walk.hits;
     for h in &all_callers {
-        let abs = root.join(&h.edge.file);
-        let is_test = is_test_file(&abs, root);
+        let is_test = calls.is_test(&h.edge.source);
         if is_test && !opts.exclude_tests {
             test_calls.push(h.clone());
         }
@@ -265,56 +268,56 @@ fn compute_impact(
         //   depth 2: callers of those constructors; callables constructing
         //            an implementor
         //   depth 3+: `traverse::callers` from each construction site.
-        let mut seen_transitive: std::collections::HashSet<Qn> =
-            std::collections::HashSet::new();
-        let add_transitive = |depth: usize,
-                                  source: &Qn,
-                                  file: &Path,
-                                  line: u32,
-                                  confidence: Confidence,
-                                  is_test: bool,
-                                  transitive: &mut BTreeMap<usize, Vec<ImpactEntry>>,
-                                  test_calls: &mut Vec<CallHit>,
-                                  seen: &mut std::collections::HashSet<Qn>| {
-            if opts.exclude_tests && is_test {
-                return;
-            }
-            if opts.tests && !is_test {
-                return;
-            }
-            // Dedup before the test push too — the same source reached via
-            // several construction sites must appear once in both sections.
-            if !seen.insert(source.clone()) {
-                return;
-            }
-            if is_test {
-                test_calls.push(CallHit {
-                    depth,
-                    edge: CallEdge {
-                        source: source.clone(),
-                        target: CallTarget::Resolved(c.qn.clone()),
-                        kind: crate::calls::graph::CallKindCompat::Construct,
-                        line,
-                        file: file.to_path_buf(),
-                        confidence,
-                        receiver: None,
-                        candidates: Vec::new(),
-                    },
+        let mut seen_transitive: std::collections::HashSet<Qn> = std::collections::HashSet::new();
+        let add_transitive =
+            |depth: usize,
+             source: &Qn,
+             file: &Path,
+             line: u32,
+             confidence: Confidence,
+             is_test: bool,
+             transitive: &mut BTreeMap<usize, Vec<ImpactEntry>>,
+             test_calls: &mut Vec<CallHit>,
+             seen: &mut std::collections::HashSet<Qn>| {
+                if opts.exclude_tests && is_test {
+                    return;
+                }
+                if opts.tests && !is_test {
+                    return;
+                }
+                // Dedup before the test push too — the same source reached via
+                // several construction sites must appear once in both sections.
+                if !seen.insert(source.clone()) {
+                    return;
+                }
+                if is_test {
+                    test_calls.push(CallHit {
+                        depth,
+                        edge: CallEdge {
+                            source: source.clone(),
+                            target: CallTarget::Resolved(c.qn.clone()),
+                            kind: crate::calls::graph::CallKindCompat::Construct,
+                            line,
+                            file: file.to_path_buf(),
+                            confidence,
+                            receiver: None,
+                            candidates: Vec::new(),
+                        },
+                    });
+                }
+                transitive.entry(depth).or_default().push(ImpactEntry {
+                    qn: source.as_str().to_string(),
+                    file: file.display().to_string(),
+                    line,
+                    kind: calls
+                        .callable_meta
+                        .get(source)
+                        .map(|m| m.kind.clone())
+                        .unwrap_or_else(|| "function".into()),
+                    confidence: Some(confidence.as_str().to_string()),
+                    depth: Some(depth),
                 });
-            }
-            transitive.entry(depth).or_default().push(ImpactEntry {
-                qn: source.as_str().to_string(),
-                file: file.display().to_string(),
-                line,
-                kind: calls
-                    .callable_meta
-                    .get(source)
-                    .map(|m| m.kind.clone())
-                    .unwrap_or_else(|| "function".into()),
-                confidence: Some(confidence.as_str().to_string()),
-                depth: Some(depth),
-            });
-        };
+            };
 
         // Same predicate as the callable traversal above — filtering inside
         // the BFS keeps excluded edges from consuming --limit, and ambiguous
@@ -326,7 +329,7 @@ fn compute_impact(
             if !opts.tests && !opts.exclude_tests {
                 return true;
             }
-            let is_test = is_test_file(&root.join(&e.file), root);
+            let is_test = calls.is_test(&e.source);
             if opts.exclude_tests {
                 !is_test
             } else {
@@ -369,7 +372,7 @@ fn compute_impact(
         // are marked seen so they never reappear as transitive entries.
         let group = collect_type_callers(calls, &c.qn);
         for e in &group.constructions {
-            let is_test = is_test_file(&root.join(&e.file), root);
+            let is_test = calls.is_test(&e.source);
             // Insert unconditionally (mark seen) as before; only the test_calls
             // push respects --hide-ambiguous, matching build_callers_section's
             // retain so an ambiguous construction isn't hidden there yet counted here.
@@ -395,13 +398,15 @@ fn compute_impact(
         if let Some(impls) = calls.implementors.get(c.qn.name()) {
             for qn in impls {
                 let meta = calls.types.get(qn);
-                let file = meta.map(|m| m.file.clone()).unwrap_or_else(|| PathBuf::from(qn.file()));
+                let file = meta
+                    .map(|m| m.file.clone())
+                    .unwrap_or_else(|| PathBuf::from(qn.file()));
                 let line = meta.map(|m| m.line).unwrap_or(0);
-                let abs = root.join(&file);
+
                 // Implementors (depth 1) are shown in the callers section and
                 // never repeated as transitive entries.
                 seen_transitive.insert(qn.clone());
-                if is_test_file(&abs, root) && !opts.exclude_tests {
+                if calls.is_test(qn) && !opts.exclude_tests {
                     test_calls.push(CallHit {
                         depth: 1,
                         edge: CallEdge {
@@ -424,8 +429,7 @@ fn compute_impact(
                         // Skip ambiguous construction seeds when hidden, so
                         // they don't leak into depth-2 transitive/test output
                         // (matches build_callers_section's retain).
-                        if !opts.include_ambiguous
-                            && matches!(e.confidence, Confidence::Ambiguous)
+                        if !opts.include_ambiguous && matches!(e.confidence, Confidence::Ambiguous)
                         {
                             continue;
                         }
@@ -464,7 +468,7 @@ fn compute_impact(
             .collect();
         resolved.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
         for (source, depth, file, line, conf) in &resolved {
-            let is_test = is_test_file(&root.join(file), root);
+            let is_test = calls.is_test(source);
             add_transitive(
                 *depth,
                 source,
@@ -568,7 +572,8 @@ fn compute_impact(
     // and `--tests` qualify through the affected-tests list, which
     // `--exclude-tests` empties by construction. `deps` and `dependents`
     // build their answer entirely from depth-1 sections.
-    let tests_reported = (opts.tests || matches!(opts.mode, ImpactMode::Tests)) && !opts.exclude_tests;
+    let tests_reported =
+        (opts.tests || matches!(opts.mode, ImpactMode::Tests)) && !opts.exclude_tests;
     report.frontier_truncated &= matches!(opts.mode, ImpactMode::All) || tests_reported;
 
     report
@@ -602,15 +607,13 @@ fn build_callees_section(
     c: &ResolvedTarget,
     calls: &CallGraph,
     opts: &ImpactOptions,
-    root: &Path,
+    _root: &Path,
 ) -> ImpactSection {
     let mut edges: Vec<CallEdge> = Vec::new();
     if c.kind == SymbolKind::Callable {
         let one_hop = traverse::callees_one_hop(calls, &c.qn);
         for e in one_hop {
-            if !opts.include_ambiguous
-                && matches!(e.confidence, Confidence::Ambiguous)
-            {
+            if !opts.include_ambiguous && matches!(e.confidence, Confidence::Ambiguous) {
                 continue;
             }
             edges.push(e);
@@ -619,35 +622,33 @@ fn build_callees_section(
     let entries: Vec<ImpactEntry> = edges
         .into_iter()
         .filter_map(|e| {
-                let (qn, file, line) = match &e.target {
-                    CallTarget::Resolved(q) => {
-                        let meta = calls.callable_meta.get(q);
-                        (
-                            q.as_str().to_string(),
-                            meta.map(|m| m.file.clone()).unwrap_or_else(|| e.file.clone()),
-                            meta.map(|m| m.line).unwrap_or(e.line),
-                        )
-                    }
-                    CallTarget::External(s) => {
-                        (format!("[external] {s}"), e.file.clone(), e.line)
-                    }
-                    CallTarget::Bare(s) => {
-                        (format!("[unresolved] {s}"), e.file.clone(), e.line)
-                    }
-                };
-                if !passes_test_flags(&file, root, opts) {
-                    return None;
+            let (qn, file, line) = match &e.target {
+                CallTarget::Resolved(q) => {
+                    let meta = calls.callable_meta.get(q);
+                    (
+                        q.as_str().to_string(),
+                        meta.map(|m| m.file.clone())
+                            .unwrap_or_else(|| e.file.clone()),
+                        meta.map(|m| m.line).unwrap_or(e.line),
+                    )
                 }
-                Some(ImpactEntry {
-                    qn,
-                    file: file.display().to_string(),
-                    line,
-                    kind: e.kind.as_str().to_string(),
-                    confidence: Some(e.confidence.as_str().to_string()),
-                    depth: None,
-                })
+                CallTarget::External(s) => (format!("[external] {s}"), e.file.clone(), e.line),
+                CallTarget::Bare(s) => (format!("[unresolved] {s}"), e.file.clone(), e.line),
+            };
+            let is_test = calls.is_test(&Qn(qn.clone()));
+            if (opts.exclude_tests && is_test) || (opts.tests && !is_test) {
+                return None;
+            }
+            Some(ImpactEntry {
+                qn,
+                file: file.display().to_string(),
+                line,
+                kind: e.kind.as_str().to_string(),
+                confidence: Some(e.confidence.as_str().to_string()),
+                depth: None,
             })
-            .collect();
+        })
+        .collect();
     // `--limit` caps display in every other section; a symbol with 300
     // callees must not print 300 rows here just because the walk was cheap.
     let total = entries.len();
@@ -668,7 +669,7 @@ fn build_callers_section(
     c: &ResolvedTarget,
     calls: &CallGraph,
     opts: &ImpactOptions,
-    root: &Path,
+    _root: &Path,
 ) -> ImpactSection {
     // Collect type-specific dependents first. For a type, implementors and
     // construction sites are the most relevant edges, so they go ahead of the
@@ -710,7 +711,7 @@ fn build_callers_section(
             return false;
         }
         if opts.tests || opts.exclude_tests {
-            let is_test = is_test_file(&root.join(&e.file), root);
+            let is_test = calls.is_test(&e.source);
             if opts.exclude_tests {
                 return !is_test;
             }
@@ -721,7 +722,13 @@ fn build_callers_section(
     if !opts.include_ambiguous {
         hits.retain(|h| !matches!(h.edge.confidence, Confidence::Ambiguous));
     }
-    hits.retain(|h| passes_test_flags(&h.edge.file, root, opts));
+    hits.retain(|h| {
+        if opts.exclude_tests {
+            !calls.is_test(&h.edge.source)
+        } else {
+            !opts.tests || calls.is_test(&h.edge.source)
+        }
+    });
     // Type implementors/constructions were collected first, so when the merged
     // list exceeds the per-section limit the appended BFS callers are trimmed,
     // not the type-specific dependents. (No-op for callable targets.)
@@ -940,7 +947,9 @@ fn colorize_confidence(c: &str) -> String {
 
 fn colorize_file_path(qn: &str, file: &str) -> String {
     let display = first_qualified_separator(qn).map_or(file, |index| &qn[..index]);
-    format!(" ({})", display).truecolor(100, 100, 100).to_string()
+    format!(" ({})", display)
+        .truecolor(100, 100, 100)
+        .to_string()
 }
 
 /// Terminal `::` segment of a qn, or the string unchanged when it's a
@@ -988,9 +997,7 @@ pub mod mcp {
 
         let a: Args = match serde_json::from_value(args) {
             Ok(v) => v,
-            Err(e) => {
-                return crate::mcp::tools::CallResult::Error(format!("bad args: {e}"))
-            }
+            Err(e) => return crate::mcp::tools::CallResult::Error(format!("bad args: {e}")),
         };
         let mode = match ImpactMode::parse(&a.mode) {
             Some(m) => m,
@@ -1007,18 +1014,12 @@ pub mod mcp {
         };
         let graph = match graph_cache::ensure_with_calls(&root, false) {
             Ok(g) => g,
-            Err(e) => {
-                return crate::mcp::tools::CallResult::Error(format!(
-                    "# error: {}", e
-                ))
-            }
+            Err(e) => return crate::mcp::tools::CallResult::Error(format!("# error: {}", e)),
         };
         let calls = match &graph.calls {
             Some(c) => c,
             None => {
-                return crate::mcp::tools::CallResult::Error(
-                    "# error: call graph is empty".into(),
-                )
+                return crate::mcp::tools::CallResult::Error("# error: call graph is empty".into())
             }
         };
         let candidates = resolve_target_full(calls, &a.target);

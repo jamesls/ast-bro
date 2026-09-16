@@ -8,6 +8,8 @@
 //! exactly like ast-grep.
 
 pub mod cli;
+mod language;
+pub use language::RunLanguage;
 
 use ast_grep_core::Language;
 use ast_grep_language::{LanguageExt, SupportLang};
@@ -25,20 +27,24 @@ pub struct RunMatch {
 }
 
 /// Detect language from file extension.
-pub fn detect_lang(path: &Path) -> Option<SupportLang> {
-    SupportLang::from_path(path)
+pub fn detect_lang(path: &Path) -> Option<RunLanguage> {
+    if path.extension().is_some_and(|extension| extension == "zig") {
+        return Some(RunLanguage::Zig);
+    }
+    SupportLang::from_path(path).map(RunLanguage::from)
 }
 
 /// Search for pattern matches in source.
 #[allow(dead_code)] // public API; prefer search_with_pattern in loops
 pub fn search(
     source: &str,
-    lang: SupportLang,
+    lang: impl Into<RunLanguage>,
     pattern: &str,
 ) -> Result<Vec<RunMatch>, String> {
+    let lang = lang.into();
     use ast_grep_core::Pattern;
-    let compiled = Pattern::try_new(pattern, lang)
-        .map_err(|e| format!("invalid pattern: {}", e))?;
+    let compiled =
+        Pattern::try_new(pattern, lang).map_err(|e| format!("invalid pattern: {}", e))?;
     search_with_pattern(source, lang, &compiled)
 }
 
@@ -48,10 +54,10 @@ pub fn search(
 /// with the same language — compile once, clone per file.
 pub fn search_with_pattern(
     source: &str,
-    lang: SupportLang,
+    lang: impl Into<RunLanguage>,
     pattern: &ast_grep_core::Pattern,
 ) -> Result<Vec<RunMatch>, String> {
-    let ast = lang.ast_grep(source);
+    let ast = lang.into().ast_grep(source);
     let matches: Vec<RunMatch> = ast
         .root()
         .find_all(pattern.clone())
@@ -77,11 +83,11 @@ pub fn search_with_pattern(
 /// with the same language — compile once, clone per file.
 pub fn rewrite_with_pattern(
     source: &str,
-    lang: SupportLang,
+    lang: impl Into<RunLanguage>,
     pattern: &ast_grep_core::Pattern,
     replacement: &str,
 ) -> Result<Option<String>, String> {
-    let mut ast = lang.ast_grep(source);
+    let mut ast = lang.into().ast_grep(source);
     let replaced = ast.replace(pattern.clone(), replacement)?;
     if replaced {
         Ok(Some(ast.generate()))
@@ -195,13 +201,14 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[allow(dead_code)] // public API; prefer rewrite_with_pattern in loops
 pub fn rewrite(
     source: &str,
-    lang: SupportLang,
+    lang: impl Into<RunLanguage>,
     pattern: &str,
     replacement: &str,
 ) -> Result<Option<String>, String> {
+    let lang = lang.into();
     use ast_grep_core::Pattern;
-    let compiled = Pattern::try_new(pattern, lang)
-        .map_err(|e| format!("invalid pattern: {}", e))?;
+    let compiled =
+        Pattern::try_new(pattern, lang).map_err(|e| format!("invalid pattern: {}", e))?;
     rewrite_with_pattern(source, lang, &compiled, replacement)
 }
 

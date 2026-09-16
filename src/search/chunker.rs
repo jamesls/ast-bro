@@ -149,6 +149,9 @@ pub fn is_indexable(path: &Path) -> Option<ChunkerKind> {
     if ext.as_deref() == Some("zig") {
         return Some(ChunkerKind::Zig);
     }
+    if ext.as_deref() == Some("zon") {
+        return Some(ChunkerKind::Plain("zon"));
+    }
     if matches!(ext.as_deref(), Some("ps1" | "psm1" | "psd1")) {
         return Some(ChunkerKind::Plain("powershell"));
     }
@@ -342,7 +345,7 @@ fn build_zig_split_plan(source: &str) -> SplitPlan {
     };
     let mut parser = tree_sitter::Parser::new();
     if parser
-        .set_language(&tree_sitter_zig::LANGUAGE.into())
+        .set_language(&crate::zig_syntax::LANGUAGE.into())
         .is_err()
     {
         plan.member_points.push(source.len());
@@ -413,9 +416,12 @@ fn collect_zig_split_points(
         // A Zig type declaration is an expression on the right-hand side of
         // a variable or field (`const Widget = struct { ... }`). Open that
         // expression so its methods and fields receive the same hierarchy as
-        // members of a Rust or Python type. Callable bodies stay opaque.
-        if !callable && !descent.exhausted() {
-            let containers = if zig_is_container_kind(kind) {
+        // members of a Rust or Python type. Descend into local and returned
+        // containers in callable bodies, including generic type factories.
+        if !descent.exhausted() {
+            let containers = if callable {
+                child.child_by_field_name("body").map(zig_embedded_containers).unwrap_or_default()
+            } else if zig_is_container_kind(kind) {
                 vec![child]
             } else if member {
                 zig_embedded_containers(child)
@@ -2251,6 +2257,19 @@ content c
             .map(|chunk| chunk.content.as_str())
             .collect();
         assert_eq!(joined, src, "structural chunks must cover source exactly");
+    }
+
+    #[test]
+    fn zig_generic_factory_members_have_breadcrumbs_and_complete_source_tiles() {
+        let source = include_str!("../../tests/fixtures/zig_016/generic.zig");
+        let chunks = chunk_source(source, "generic.zig", ChunkerKind::Zig);
+        let outline = chunks.iter().find(|chunk| chunk.kind == ChunkKind::Outline).unwrap();
+        assert!(outline.content.contains("Box > init"), "{}", outline.content);
+        assert!(outline.content.contains("Box > read"), "{}", outline.content);
+        let joined: String = chunks.iter()
+            .filter(|chunk| matches!(chunk.kind, ChunkKind::Source | ChunkKind::Enclosing))
+            .map(|chunk| chunk.content.as_str()).collect();
+        assert_eq!(joined, source);
     }
 
     #[test]

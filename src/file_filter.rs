@@ -132,8 +132,17 @@ pub fn should_skip_path(path: &Path, repo_root: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(repo_root) else {
         return false;
     };
+    let mut in_source = repo_root.file_name().is_some_and(|name| name == "src");
     rel.components().any(|c| {
         let s = c.as_os_str().to_string_lossy();
+        // `src/build` is implementation code in Zig projects. Root build
+        // outputs remain excluded, as do caches anywhere in a source tree.
+        if s == "src" {
+            in_source = true;
+        }
+        if s == "build" && in_source {
+            return false;
+        }
         HARDCODED_IGNORE_DIRS.iter().any(|d| *d == s)
     })
 }

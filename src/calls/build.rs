@@ -16,9 +16,7 @@ use crate::calls::resolve;
 use crate::core::{CallSite, Declaration, DeclarationKind};
 use crate::deps::DepGraph;
 use crate::main_helpers::parse_file_for_hook;
-use crate::symbol_path::{
-    first_unquoted_byte, last_qualified_separator, last_unquoted_byte,
-};
+use crate::symbol_path::{first_unquoted_byte, last_qualified_separator, last_unquoted_byte};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -137,9 +135,9 @@ pub fn extract_file(root: &Path, file: &Path) -> Option<FilePass> {
         &mut types,
     );
 
-     Some(FilePass {
-         file: file.to_path_buf(),
-         defined,
+    Some(FilePass {
+        file: file.to_path_buf(),
+        defined,
         callable_locations,
         imports: parse.imports,
         raw_edges,
@@ -164,7 +162,11 @@ fn walk(
     for d in decls {
         let mut next_parents = parents.clone();
         if !d.name.is_empty() {
-            next_parents.push(d.name.clone());
+            next_parents.push(if rel_file.ends_with(".zig") && d.name.starts_with("@\"") {
+                crate::zig_syntax::identifier(&d.name)
+            } else {
+                d.name.clone()
+            });
         }
 
         if is_callable(d) && !d.name.is_empty() {
@@ -173,7 +175,11 @@ fn walk(
             callable_locations.push(CallableMeta {
                 file: PathBuf::from(rel_file),
                 line: d.start_line as u32,
-                kind: d.kind.to_string(),
+                kind: if d.native_kind.as_deref() == Some("test") {
+                    "test".into()
+                } else {
+                    d.kind.to_string()
+                },
             });
             for cs in &d.calls {
                 raw_edges.push(call_to_raw(qn.clone(), cs));
@@ -183,10 +189,7 @@ fn walk(
             types.push((
                 qn,
                 TypeMeta {
-                    kind: d
-                        .native_kind
-                        .clone()
-                        .unwrap_or_else(|| d.kind.to_string()),
+                    kind: d.native_kind.clone().unwrap_or_else(|| d.kind.to_string()),
                     file: PathBuf::from(rel_file),
                     line: d.start_line as u32,
                     bases: d.bases.clone(),

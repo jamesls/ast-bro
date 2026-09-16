@@ -243,14 +243,12 @@ Every source-code language adapter emits `Declaration::calls`. The SQL and Markd
 
 - **Ruby**: bare calls without parentheses or arguments, such as `helper`, parse as `identifier` rather than `call`. The grammar cannot distinguish them from local variable references.
 - **Python**: the resolver has no Jedi-style receiver type inference. A call such as `obj.method()` whose receiver type depends on runtime flow falls through to passes B and C. Adding Jedi would require a Python runtime dependency.
-- **Zig named modules**: only relative `.zig` imports resolve to project files. A named `@import("mypkg")` remains external because resolving it would require evaluating the Zig program in `build.zig`.
-- **Zig grammar**: `tree-sitter-zig` 1.1.2 does not parse Zig 0.15 inline assembly clobbers such as `::: .{ .memory = true }`. The adapter reports the parse error while retaining declarations around the statement.
-- **Zig comptime dispatch**: calls selected through `@field`, inline dispatch tables, or function-pointer fields do not produce static target edges.
+- **Zig**: generated modules, C preprocessing, arbitrary comptime evaluation, and runtime-selected callbacks can remain unresolved. Literal `@call` and `@field` targets, lexical aliases, expected declaration-literal types, and simple generic factories are supported. See [Zig support](zig.md).
 - **External-base ancestor walk**: `callees` on a type stops at depth 1 when a base type does not resolve to a project file. The graph cannot traverse source it cannot see.
 
 ## Unified graph cache
 
-The call graph shares `.ast-bro/deps/graph.bin` with the dependency graph as `UnifiedGraph { deps, calls: Option<CallGraph> }`. The schema constant is `JSON_SCHEMA_GRAPH_INDEX = "ast-bro.graph-index.v3"`. The directory keeps its `deps/` name because changing the path would force a separate rebuild.
+The call graph shares `.ast-bro/deps/graph.bin` with the dependency graph as `UnifiedGraph { deps, calls: Option<CallGraph> }`. The schema constant is `JSON_SCHEMA_GRAPH_INDEX = "ast-bro.graph-index.v4"`. The directory keeps its `deps/` name because changing the path would force a separate rebuild.
 
 ### Disk layout
 
@@ -285,13 +283,11 @@ happens, the process exits.
 
 ### Schema migration
 
-The legacy `deps-index.v1` cache was retired in v2.1.0, while the path remained `.ast-bro/deps/graph.bin`. The current schema is `ast-bro.graph-index.v3`. `cache::load_with_delta` compares the stored string with this value. Older schema values return `LoadOutcome::Missing`, and `load_or_build` rebuilds the cache in place.
+The legacy `deps-index.v1` cache was retired in v2.1.0, while the path remained `.ast-bro/deps/graph.bin`. The current schema is `ast-bro.graph-index.v4`. `cache::load_with_delta` compares the stored string with this value. Older schema values return `LoadOutcome::Missing`, and `load_or_build` rebuilds the cache in place.
 
 Version 2 also fixes a bincode round-trip bug. `#[serde(skip_serializing_if)]` on `DepEdge::local_name`, `DepEdge::raw_path`, `CallEdge::receiver`, and `CallEdge::candidates` omitted positional fields and shifted the bytes that followed. Removing those annotations and rejecting v1 ensures the next graph query writes a complete cache.
 
-Version 3 invalidates call graphs produced before the complete Zig adapter and
-namespace resolver. Without the bump, an unchanged Zig checkout could keep
-missing declarations and edges even after upgrading the binary.
+Version 4 invalidates graphs produced before the Zig 0.16 grammar, lexical scope, and inline test fixes. Test callables retain `kind = test`; nested helpers inherit test status through their qualified ancestors.
 
 ### Per-file invalidation
 

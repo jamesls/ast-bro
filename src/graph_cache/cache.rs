@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 pub const CACHE_SCHEMA: &str = JSON_SCHEMA_GRAPH_INDEX;
 /// Legacy schema from pre-rename installs — still readable.
-pub const CACHE_SCHEMA_LEGACY: &str = "ast-outline.graph-index.v3";
+pub const CACHE_SCHEMA_LEGACY: &str = "ast-outline.graph-index.v4";
 
 /// On-disk wrapper combining the unified graph + the file fingerprints used
 /// for freshness detection.

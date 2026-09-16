@@ -58,6 +58,7 @@ fn _walk(
     // the prefix used for children. For type-bearing decls, emit and recurse.
     if !is_namespace && visible && !decl.name.is_empty() {
         out.push(SurfaceEntry {
+            conditional: false,
             qualified_path: qname.clone(),
             kind: decl.kind,
             signature: decl.signature.clone(),

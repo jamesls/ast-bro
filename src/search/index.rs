@@ -107,8 +107,8 @@ const MIN_CANDIDATES: usize = 100;
 /// Current schema version written by all new builds.
 // v2 added `breadcrumb` and `kind` to `Chunk`, which changed the bincode layout
 // of chunks.bin. v3 keeps that layout but changes Zig chunk semantics, so old
-// indexes still need a rebuild.
-const SCHEMA: &str = "ast-bro.search-index.v3";
+// indexes still need a rebuild. v4 refreshes the grammar and generic members.
+const SCHEMA: &str = "ast-bro.search-index.v4";
 
 /// On-disk paths under a repo's `.ast-bro/index/` directory.
 #[derive(Debug, Clone)]

@@ -115,7 +115,10 @@ fn show_missing_symbol_exits_2_on_stderr() {
 fn show_missing_symbol_json_emits_error_envelope() {
     let (code, stdout, stderr) = run(&["show", "src/core.rs", "ZzNonexistentSymbolZz", "--json"]);
     assert_eq!(code, Some(2));
-    assert!(stdout.is_empty(), "no valid-looking empty payload:\n{stdout}");
+    assert!(
+        stdout.is_empty(),
+        "no valid-looking empty payload:\n{stdout}"
+    );
     let doc = envelope(&stderr);
     assert_eq!(doc["kind"], "symbol_not_found");
 }
@@ -125,7 +128,10 @@ fn show_unsupported_file_exits_2_on_stderr() {
     let (code, stdout, stderr) = run(&["show", "Cargo.toml", "package"]);
     assert_eq!(code, Some(2), "stderr:\n{stderr}");
     assert!(stdout.is_empty());
-    assert!(stderr.contains("unsupported file type"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("unsupported file type"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -201,7 +207,14 @@ fn digest_accepts_map_scope_flags() {
 fn map_preset_digest_json_matches_digest_json() {
     // #37: `digest` is exactly `map --preset digest`. Both calls must have
     // *run* — two identical failures would otherwise satisfy the comparison.
-    let (code_a, a, err_a) = run(&["map", "src/core.rs", "--preset", "digest", "--json", "--compact"]);
+    let (code_a, a, err_a) = run(&[
+        "map",
+        "src/core.rs",
+        "--preset",
+        "digest",
+        "--json",
+        "--compact",
+    ]);
     let (code_b, b, err_b) = run(&["digest", "src/core.rs", "--json", "--compact"]);
     assert_eq!(code_a, Some(0), "map --preset digest failed:\n{err_a}");
     assert_eq!(code_b, Some(0), "digest failed:\n{err_b}");
@@ -322,7 +335,10 @@ fn map_on_small_input_stays_quiet() {
     .expect("write fixture");
     let (code, stdout, stderr) = run(&["map", dir.path().to_str().unwrap()]);
     assert_eq!(code, Some(0));
-    assert!(stdout.len() < 25_000, "fixture must stay under the threshold");
+    assert!(
+        stdout.len() < 25_000,
+        "fixture must stay under the threshold"
+    );
     assert!(
         !stderr.contains("# hint:"),
         "small directories must not nag:\n{stderr}"
@@ -413,14 +429,17 @@ fn run_with_no_paths_still_defaults_to_the_current_directory() {
 }
 
 #[test]
-fn run_zig_language_error_explains_ast_grep_limitation() {
-    let (code, stdout, stderr) = run(&["run", "-p", "fn $F() {}", "--lang", "zig"]);
-    assert_eq!(code, Some(2), "stderr:\n{stderr}");
-    assert!(stdout.is_empty(), "stdout must be empty:\n{stdout}");
-    assert!(
-        stderr.contains("zig is not supported by run: ast-grep has no Zig grammar"),
-        "stderr:\n{stderr}"
-    );
+fn run_zig_uses_the_bundled_grammar() {
+    let (code, stdout, stderr) = run(&[
+        "run",
+        "tests/fixtures/zig_016/helper.zig",
+        "-p",
+        "pub fn $F() void {}",
+        "--lang",
+        "zig",
+    ]);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert!(stdout.contains("work"), "stdout:\n{stdout}");
 }
 
 #[test]
@@ -468,12 +487,8 @@ fn find_related_missing_chunk_rejects_in_json_mode_too() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("present.rs"), "pub fn f() {}\n").expect("write fixture");
     let root = dir.path().to_str().expect("utf8 path");
-    let (code, stdout, stderr) = run(&[
-        "find-related",
-        "no/such/file/anywhere.rs:3",
-        root,
-        "--json",
-    ]);
+    let (code, stdout, stderr) =
+        run(&["find-related", "no/such/file/anywhere.rs:3", root, "--json"]);
     assert_eq!(code, Some(2), "stderr:\n{stderr}");
     assert!(stdout.is_empty(), "stdout must be empty:\n{stdout}");
     let doc = envelope(&stderr);

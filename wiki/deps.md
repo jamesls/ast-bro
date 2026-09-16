@@ -106,7 +106,7 @@ A cold graph build runs the filtered suffix-index walk once. A dependency delta 
 | C++ | Quoted and angle-bracket `#include` directives, including includes inside common preprocessor wrappers. |
 | PHP | Namespace `use` forms, grouped imports, aliases, and literal `require` or `include` variants. |
 | Ruby | Literal `require`, `require_relative`, `load`, and `autoload` calls. |
-| Zig | Every literal `@import("spec")` on a line, with an optional `const` binding. |
+| Zig | Literal `@import` AST nodes, including multiline calls and decoded strings. |
 
 Zig preserves import bindings for both graph layers. For `const helper = @import("util/helper.zig");`, dependency extraction records `local_name = "helper"` and normalizes the file spec to `./util/helper.zig`. The Zig adapter also emits `ImportBinding { local: "helper", module: "./util/helper.zig" }`. Call resolution maps `helper.work()` to `helper.zig::work` only when the imported file declares `work` at file scope. `@embedFile` is an asset reference and is not extracted.
 
@@ -123,7 +123,7 @@ Zig preserves import bindings for both graph layers. For `const helper = @import
 - C++ resolves quoted includes relative to the importer. Angle-bracket system headers remain external.
 - PHP resolves literal relative `require` and `include` paths directly. Namespace imports try Composer PSR-4 prefixes, direct suffix lookup, and a final class-name fallback.
 - Ruby resolves only `require_relative`. Extraction adds `.rb` when the source omits it. Bare `require`, `load`, and `autoload` remain external because they depend on `$LOAD_PATH` or installed gems.
-- Zig resolves only explicit relative `.zig` file imports. A spec such as `@import("helper.zig")` becomes `./helper.zig` and must name an existing file at that path. Named imports such as `std`, `builtin`, `root`, and modules configured by `build.zig` remain external because resolving them would require evaluating the build script.
+- Zig resolves relative `.zig` and `.zon` imports and unambiguous literal module wiring in `build.zig`. A spec such as `@import("helper.zig")` becomes `./helper.zig` and must name an existing file. See [Zig support](zig.md) for the supported build forms and remaining limits.
 
 Unresolved imports stay in `DepGraph::external` with their source spelling. They do not become edges to a same-named local file by guesswork.
 
@@ -154,7 +154,7 @@ CacheFile {
 
 The dependency graph is always present. The call graph starts as `None` and `promote_calls` builds and persists it when a symbol query first needs it.
 
-The cache wrapper schema is `ast-bro.graph-index.v3`. The loader treats older schemas as a mismatch and performs a cold rebuild. Version 3 invalidates partial call graphs created before complete Zig namespace and escaped-identifier resolution. The separate `DepGraph.schema` field still identifies the dependency payload; it does not replace the wrapper version check.
+The cache wrapper schema is `ast-bro.graph-index.v4`. The loader treats older schemas as a mismatch and performs a cold rebuild. Version 4 invalidates graphs created before Zig 0.16 grammar, lexical scope, and inline test fixes. The separate `DepGraph.schema` field still identifies the dependency payload; it does not replace the wrapper version check.
 
 `search::cache::compute_delta` compares the recorded files with the working tree. It uses path membership plus mtime and size checks, and hashes a file when metadata changes. A stale cache goes through `apply_delta_to_deps`. That function removes entries for changed files, rebuilds the suffix index, re-extracts added or modified files, and recomputes dependency statistics. If `UnifiedGraph.calls` is present, `apply_delta_to_calls` patches the symbol graph against the updated dependency graph. A dependency patch failure falls back to a cold build.
 

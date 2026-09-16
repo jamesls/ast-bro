@@ -17,8 +17,8 @@ use crate::calls::graph::{CallEdge, CallGraph, CallKindCompat, CallTarget, Confi
 use crate::calls::{render, traverse};
 use crate::graph_cache;
 use crate::symbol_path::{
-    first_qualified_separator, first_unquoted_byte, last_qualified_separator,
-    last_unquoted_any, last_unquoted_byte,
+    first_qualified_separator, first_unquoted_byte, last_qualified_separator, last_unquoted_any,
+    last_unquoted_byte,
 };
 use crate::UNLIMITED;
 
@@ -35,7 +35,7 @@ pub fn run_callers(
     json: bool,
     pretty: bool,
 ) -> i32 {
-    let (root, graph) = match graph_cache::load_for_symbol_query("callers", path, rebuild, json) {
+    let (_, graph) = match graph_cache::load_for_symbol_query("callers", path, rebuild, json) {
         Ok(pair) => pair,
         Err(code) => return code,
     };
@@ -54,31 +54,22 @@ pub fn run_callers(
             SymbolKind::Callable => {
                 // Walk unbounded so the header can report the true total;
                 // `--limit` trims the *display* below (issue #32).
-                let info = traverse::callers_info(
-                    calls,
-                    &c.qn,
-                    depth.max(1),
-                    UNLIMITED,
-                    |edge| {
-                        if !include_ambiguous && matches!(edge.confidence, Confidence::Ambiguous) {
-                            return false;
-                        }
-                        if tests || exclude_tests {
-                            let is_test = crate::file_filter::is_test_file(
-                                &root.join(&edge.file),
-                                &root,
-                            );
-                            if exclude_tests {
-                                if is_test {
-                                    return false;
-                                }
-                            } else if !is_test {
+                let info = traverse::callers_info(calls, &c.qn, depth.max(1), UNLIMITED, |edge| {
+                    if !include_ambiguous && matches!(edge.confidence, Confidence::Ambiguous) {
+                        return false;
+                    }
+                    if tests || exclude_tests {
+                        let is_test = calls.is_test(&edge.source);
+                        if exclude_tests {
+                            if is_test {
                                 return false;
                             }
+                        } else if !is_test {
+                            return false;
                         }
-                        true
-                    },
-                );
+                    }
+                    true
+                });
                 frontier_truncated |= info.frontier_truncated;
                 hits.extend(info.hits);
             }
@@ -88,17 +79,16 @@ pub fn run_callers(
                 // hits above — implementations and constructions both
                 // carry repo-relative file paths.
                 if tests || exclude_tests {
-                    let keep = |file: &Path| {
-                        let is_test =
-                            crate::file_filter::is_test_file(&root.join(file), &root);
+                    let keep = |qn: &Qn| {
+                        let is_test = calls.is_test(qn);
                         if exclude_tests {
                             !is_test
                         } else {
                             is_test
                         }
                     };
-                    group.implementations.retain(|i| keep(&i.file));
-                    group.constructions.retain(|e| keep(&e.file));
+                    group.implementations.retain(|i| keep(&i.qn));
+                    group.constructions.retain(|e| keep(&e.source));
                     // The filter narrows the query itself; totals report
                     // the post-filter truth (display truncation below
                     // leaves them untouched).
@@ -146,23 +136,18 @@ pub fn run_callers(
         .filter(|c| matches!(c.kind, SymbolKind::Callable))
         .map(|c| c.qn.clone())
         .collect();
-    let facts = render::UnattributedFacts::collect(
-        calls,
-        &callable_qns,
-        include_ambiguous,
-        limit,
-        &|e| {
+    let facts =
+        render::UnattributedFacts::collect(calls, &callable_qns, include_ambiguous, limit, &|e| {
             if !(tests || exclude_tests) {
                 return true;
             }
-            let is_test = crate::file_filter::is_test_file(&root.join(&e.file), &root);
+            let is_test = calls.is_test(&e.source);
             if exclude_tests {
                 !is_test
             } else {
                 is_test
             }
-        },
-    );
+        });
     if let Some(note) = facts.hidden_note(target, "--hide-ambiguous") {
         eprintln!("{note}");
     }
@@ -658,10 +643,9 @@ mod tests {
             Qn::new(r#"helper.zig::Container::@"method::later""#),
             Vec::new(),
         );
-        calls.forward.insert(
-            Qn::new("helper.zig::Container::Nested::method"),
-            Vec::new(),
-        );
+        calls
+            .forward
+            .insert(Qn::new("helper.zig::Container::Nested::method"), Vec::new());
 
         let methods = methods_of_type(&calls, &Qn::new("helper.zig::Container"));
         assert_eq!(methods.len(), 1);

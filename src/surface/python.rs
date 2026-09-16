@@ -271,6 +271,7 @@ impl Walker {
             return;
         }
         self.entries.push(SurfaceEntry {
+            conditional: false,
             qualified_path: qpath,
             kind: decl.kind,
             signature: decl.signature.clone(),
@@ -295,6 +296,7 @@ impl Walker {
             return;
         }
         self.entries.push(SurfaceEntry {
+            conditional: false,
             qualified_path: qpath,
             kind: existing.kind,
             signature: existing.signature.clone(),
